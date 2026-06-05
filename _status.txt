@@ -1,0 +1,8 @@
+=== swift alive? ===
+ALIVE
+=== /tmp/claude-0 size ===
+4.0K	/tmp/claude-0
+=== df ===
+overlay          12T  821G   11T   7% /
+=== tasks dir file count ===
+18
