@@ -36,6 +36,8 @@ CoLaR 专属超参通过环境变量传入（ms-swift 的 argument dataclass 不
 import json
 import os
 import random
+from functools import wraps
+from types import MethodType
 from typing import List, Optional, Tuple
 
 import torch
@@ -80,11 +82,13 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
         self.colar_entropy_weight = _env_float('COLAR_ENTROPY_WEIGHT', 0.0)
         self.colar_embed_loss = os.environ.get('COLAR_EMBED_LOSS', 'nll').lower()
         self.colar_sqrt_mean = _env_bool('COLAR_SQRT_MEAN', False)
-        deterministic = _env_bool('COLAR_DETERMINISTIC', False)
+        self.colar_deterministic = _env_bool('COLAR_DETERMINISTIC', False)
 
         self.think_open_id = THINK_OPEN_ID
         self.think_close_id = THINK_CLOSE_ID
         self.colar_pad_id = self.tokenizer.pad_token_id
+        newline_ids = self.tokenizer.encode('\n', add_special_tokens=False)
+        self.colar_newline_id = newline_ids[0] if len(newline_ids) == 1 else None
 
         # ---- 定位 thinker / 文本主干 / lm_head / embedding ----
         base_model = self.template.get_base_model(self.model)  # 解 PEFT 包装
@@ -95,14 +99,17 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
         self._embed_tokens = thinker.get_input_embeddings()
 
         hidden_size = self._embed_tokens.weight.shape[1]
-        intermediate = _env_int('COLAR_LP_INTERMEDIATE', hidden_size)
+        self.colar_hidden_size = hidden_size
+        self.colar_lp_intermediate = _env_int('COLAR_LP_INTERMEDIATE', hidden_size)
 
         # ---- 实测 embeds_std（替代硬编码 MODEL_EMB_STD）----
         self.embeds_std = compute_embeds_std(thinker)
 
         # ---- 构建 latent head 并挂为 model 子模块（fp32，数值稳定）----
         latent_policy = LatentPolicy(
-            feature_size=hidden_size, intermediate_size=intermediate, deterministic=deterministic)
+            feature_size=hidden_size,
+            intermediate_size=self.colar_lp_intermediate,
+            deterministic=self.colar_deterministic)
         dev = self._embed_tokens.weight.device
         latent_policy = latent_policy.to(device=dev, dtype=torch.float32)
         for p in latent_policy.parameters():
@@ -110,12 +117,13 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
         # 挂在 PEFT 外层 model 上，确保 state_dict / optimizer 能看到
         self.model.latent_policy = latent_policy
         self.latent_policy = latent_policy
+        self._install_colar_forward()
 
         logger.info(f'[colar] max_r={self.colar_max_r} fixed_r={self.colar_fixed_r} '
                     f'ce_w={self.colar_ce_weight} '
                     f'embed_w={self.colar_embed_weight} embed_loss={self.colar_embed_loss} '
-                    f'deterministic={deterministic} embeds_std={self.embeds_std:.5f} '
-                    f'hidden={hidden_size} lp_inter={intermediate}')
+                    f'deterministic={self.colar_deterministic} embeds_std={self.embeds_std:.5f} '
+                    f'hidden={hidden_size} lp_inter={self.colar_lp_intermediate}')
 
     # ---- 确保 latent head 进入优化器 ----
     def create_optimizer(self, *args, **kwargs):
@@ -135,9 +143,21 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
         try:
             if output_dir is not None and self.is_world_process_zero():
                 torch.save(self.latent_policy.state_dict(), os.path.join(output_dir, 'latent_policy.pt'))
-                meta = {'embeds_std': self.embeds_std,
-                        'max_r': self.colar_max_r,
-                        'embed_loss': self.colar_embed_loss}
+                meta = {
+                    'embeds_std': self.embeds_std,
+                    'hidden_size': self.colar_hidden_size,
+                    'lp_intermediate': self.colar_lp_intermediate,
+                    'deterministic': self.colar_deterministic,
+                    'max_r': self.colar_max_r,
+                    'fixed_r': self.colar_fixed_r,
+                    'ce_weight': self.colar_ce_weight,
+                    'embed_weight': self.colar_embed_weight,
+                    'entropy_weight': self.colar_entropy_weight,
+                    'embed_loss': self.colar_embed_loss,
+                    'sqrt_mean': self.colar_sqrt_mean,
+                    'think_open_id': self.think_open_id,
+                    'think_close_id': self.think_close_id,
+                }
                 with open(os.path.join(output_dir, 'colar_config.json'), 'w') as f:
                     json.dump(meta, f, ensure_ascii=False, indent=2)
                 logger.info(f'[colar] saved latent_policy.pt -> {output_dir}')
@@ -145,13 +165,40 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
             logger.warning(f'[colar] save latent_policy failed: {e}')
 
     # ===================== 核心 =====================
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    def _install_colar_forward(self):
+        """
+        Route CoLaR's custom forward through the top-level model object.
+
+        In DDP, gradients are only reduced reliably when the wrapped module's
+        forward is entered. Calling cached submodules directly from
+        compute_loss bypasses that wrapper, which is fine for single-process
+        device_map but fragile for MP+DDP.
+        """
+        if getattr(self.model, '_colar_forward_installed', False):
+            return
+
+        original_forward = self.model.forward
+        trainer = self
+
+        @wraps(original_forward)
+        def colar_forward(model_self, *args, **kwargs):
+            if args or 'labels' not in kwargs:
+                return original_forward(*args, **kwargs)
+            return trainer._colar_forward_impl(kwargs)
+
+        self.model._colar_original_forward = original_forward
+        self.model.forward = MethodType(colar_forward, self.model)
+        self.model._colar_forward_installed = True
+        logger.info('[colar] installed top-level forward hook for DDP-visible custom loss')
+
+    def _colar_forward_impl(self, inputs):
         # ms-swift 会注入这些，CoLaR 自管 loss，全部弹出，避免传进模型
         inputs.pop('compute_loss_func', None)
         inputs.pop('loss_scale', None)
         inputs.pop('text_position_ids', None)
         inputs.pop('channel', None)
         inputs.pop('position_ids', None)            # 压缩会改长度，position_ids 需重算
+        output_router_logits = inputs.pop('output_router_logits', None)
 
         input_ids = inputs['input_ids']             # [B, L]
         labels = inputs.pop('labels')               # [B, L]，前缀已 -100
@@ -188,11 +235,15 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
         position_ids = torch.clamp_min(attn.long().cumsum(dim=1) - 1, 0)
 
         # 5) 文本主干前向，取 last_hidden_state
+        text_kwargs = {}
+        if output_router_logits is not None:
+            text_kwargs['output_router_logits'] = output_router_logits
         text_out = self._text_model(
             inputs_embeds=embeds,
             attention_mask=attn,
             position_ids=position_ids,
             use_cache=False,            # 与 gradient_checkpointing 兼容
+            **text_kwargs,
         )
         hidden = text_out.last_hidden_state          # [B, L', H]
         logits = self._lm_head(hidden)               # [B, L', V]
@@ -211,20 +262,29 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
         if self.colar_entropy_weight != 0:
             total = total + self.colar_entropy_weight * entropy.to(loss_dev)
 
+        return {
+            'loss': total.to(device),
+            'logits': logits,
+            'ce_loss': ce_loss,
+            'embed_loss': embed_loss,
+            'entropy': entropy,
+            'r': torch.tensor(float(r), device=loss_dev),
+        }
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        outputs = model(**inputs)
+
         # 记录指标
         mode = 'train' if self.model.training else 'eval'
-        self.custom_metrics[mode]['ce_loss'].update(ce_loss.detach())
-        self.custom_metrics[mode]['embed_loss'].update(embed_loss.detach())
+        self.custom_metrics[mode]['ce_loss'].update(outputs['ce_loss'].detach())
+        self.custom_metrics[mode]['embed_loss'].update(outputs['embed_loss'].detach())
         if self.colar_entropy_weight != 0:
-            self.custom_metrics[mode]['entropy'].update(entropy.detach())
-        self.custom_metrics[mode]['r'].update(torch.tensor(float(r), device=loss_dev))
+            self.custom_metrics[mode]['entropy'].update(outputs['entropy'].detach())
+        self.custom_metrics[mode]['r'].update(outputs['r'].detach())
 
         if return_outputs:
-            outputs = type('ColarOutput', (), {})()
-            outputs.logits = logits
-            outputs.loss = total
-            return total.to(device), outputs
-        return total.to(device)   # HF Trainer 要求 loss 回到原始输入设备（cuda:0）
+            return outputs['loss'], outputs
+        return outputs['loss']   # HF Trainer 要求 loss 回到原始输入设备（cuda:0）
 
     # ---------- 工具 ----------
     def _build_think_mask(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -317,14 +377,29 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
                 seqs_goldsrc.append(emb_b[:valid_len])
                 continue
 
-            prefix_embed = emb_b[:o + 1]                 # 含 <think>
-            prefix_label = lab_b[:o + 1]
-            reason_embed = emb_b[o + 1:c]                # 思考 tokens
-            reason_ids = input_ids[b, o + 1:c]
+            # 推理 prompt 由 template 生成到 `<think>\n` 为止；latent_policy 的第一步
+            # 输入是这个换行 token 的 hidden state。因此 r>1 压缩时必须把换行留在
+            # uncompressed prefix 中，从换行之后的真实思考内容开始压缩。否则训练的
+            # 第一个 compressed embedding 会是 mean('\n', first_reason_token)，而推理
+            # 已经显式喂入了 '\n'，第一步 rollout 从一开始就错位。
+            reason_start = o + 1
+            if self.colar_newline_id is not None and reason_start < c and row[reason_start] == self.colar_newline_id:
+                reason_start += 1
+
+            prefix_embed = emb_b[:reason_start]          # 含 <think> 以及模板注入的换行
+            prefix_label = lab_b[:reason_start]
+            reason_embed = emb_b[reason_start:c]         # 不含 prompt 里的换行
+            reason_ids = input_ids[b, reason_start:c]
             answer_embed = emb_b[c:valid_len]            # 含 </think> + 答案
             answer_label = lab_b[c:valid_len]
 
             n = reason_embed.shape[0]
+            if n == 0:
+                seqs_embed.append(torch.cat([prefix_embed, answer_embed], dim=0))
+                seqs_label.append(torch.cat([prefix_label, answer_label], dim=0))
+                seqs_think.append(torch.zeros(prefix_embed.shape[0] + answer_embed.shape[0], device=device))
+                seqs_goldsrc.append(torch.cat([prefix_embed, answer_embed], dim=0))
+                continue
             rem = (-n) % r                               # 右 pad 到 r 的倍数
             if rem > 0:
                 reason_embed_p = torch.cat([reason_embed, reason_embed.new_zeros(rem, H)], dim=0)
@@ -351,7 +426,13 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
             emb_seq = torch.cat([prefix_embed, comp_embed, answer_embed], dim=0)
             lab_seq = torch.cat([prefix_label, comp_label, answer_label], dim=0)
             think_seq = torch.zeros(emb_seq.shape[0], device=device)
-            think_seq[prefix_embed.shape[0]: prefix_embed.shape[0] + k] = 1.0
+            # 训练 latent_policy(hidden[t]) -> embedding[t+1]。推理第一步使用
+            # prompt 最后一个 token（通常是 '\n'）的 hidden state 预测第一个
+            # compressed embedding，因此这里要把 prefix 的最后一个 token 也纳入
+            # latent loss mask；之后每个 compressed token 预测下一个 compressed token，
+            # 最后一个 compressed token 预测 </think> embedding。
+            anchor = prefix_embed.shape[0] - 1
+            think_seq[anchor: prefix_embed.shape[0] + k] = 1.0
 
             seqs_embed.append(emb_seq)
             seqs_label.append(lab_seq)

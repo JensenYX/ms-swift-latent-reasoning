@@ -1,13 +1,16 @@
 #!/bin/bash
 # =============================================================================
-# CoLaR overfit 自检：在 2 条样本上反复训练，验证整条链路（forward→loss→backward→optim）正确。
+# CoLaR overfit 自检（r=5 固定）：在 r=2 已打通后，验证更高压缩率的 latent rollout。
 #
-# 判据：
-#   - r=1（不压缩、确定性）下，train/ce_loss 应快速下降到接近 0（能把答案背下来）。
-#   - train/embed_loss 是高斯 NLL，会持续下降甚至变负，这正常，不作为判据。
-#   - 若 ce_loss 不降 → 管线有 bug（梯度没回流 / label 错位 / forward 不对）。
+# 默认沿用刚在 r=2 上成功的配置：
+#   - COLAR_EMBED_LOSS=mse
+#   - COLAR_SQRT_MEAN=1
+#   - COLAR_FIXED_R=5
+#   - NPROC_PER_NODE=4
 #
-# 用法: bash overfit_check.sh
+# 用法:
+#   bash overfit_check_r5.sh
+#   MAX_STEPS=300 SAVE_STEPS=50 SAVE_TOTAL_LIMIT=6 bash overfit_check_r5.sh
 # =============================================================================
 set -e
 
@@ -17,34 +20,55 @@ conda activate "${CONDA_ENV}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL_PATH=/apdcephfs_tj6/share_303840540/hunyuan/jensenwang/model_warehouse/Qwen3-Omni-30B-A3B-Instruct
-OUTPUT_DIR=${SCRIPT_DIR}/output/qwen3omni_colar
-DATASET_PATH=${OUTPUT_DIR}/overfit_text.jsonl
+: "${OUTPUT_DIR:=${SCRIPT_DIR}/output/qwen3omni_colar_r5_mse_sqrt}"
+: "${DATASET_PATH:=${SCRIPT_DIR}/output/qwen3omni_colar/overfit_text.jsonl}"
 PLUGIN=${SCRIPT_DIR}/colar_plugin/plugin.py
 
-# ── CoLaR 超参：overfit 用 r=1，对齐原版 SFT 前提（latent head 非确定性，log_std 可学）──
-# 注意：deterministic=1 + nll 是病态组合——高斯 NLL 含 0.5*((x-μ)/σ)²，σ→0 会发散到 1e17，
-#       淹没 CE 梯度（原版 colar.py 的 SFT 也不用此组合）。判据仍只看 train/ce_loss 是否→~0。
-export COLAR_MAX_R=1
-export COLAR_CE_WEIGHT=1.0
-export COLAR_EMBED_WEIGHT=1.0
-export COLAR_ENTROPY_WEIGHT=0.0
-export COLAR_EMBED_LOSS=nll
-export COLAR_DETERMINISTIC=0
+: "${COLAR_MAX_R:=5}"
+: "${COLAR_FIXED_R:=5}"
+: "${COLAR_CE_WEIGHT:=1.0}"
+: "${COLAR_EMBED_WEIGHT:=1.0}"
+: "${COLAR_ENTROPY_WEIGHT:=0.0}"
+: "${COLAR_EMBED_LOSS:=mse}"
+: "${COLAR_DETERMINISTIC:=0}"
+: "${COLAR_SQRT_MEAN:=1}"
+export COLAR_MAX_R
+export COLAR_FIXED_R
+export COLAR_CE_WEIGHT
+export COLAR_EMBED_WEIGHT
+export COLAR_ENTROPY_WEIGHT
+export COLAR_EMBED_LOSS
+export COLAR_DETERMINISTIC
+export COLAR_SQRT_MEAN
 
-# 单进程多卡 device_map（30B 单卡放不下）；不要设 NPROC_PER_NODE
 : "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"
-: "${SAVE_STEPS:=10}"
-: "${SAVE_TOTAL_LIMIT:=3}"
+: "${NPROC_PER_NODE:=4}"
+: "${SAVE_STEPS:=50}"
+: "${SAVE_TOTAL_LIMIT:=6}"
 : "${SAVE_ONLY_MODEL:=true}"
 : "${WARMUP_RATIO:=0.05}"
-: "${MAX_STEPS:=60}"
+: "${MAX_STEPS:=300}"
 export CUDA_VISIBLE_DEVICES
 
-echo ">>> overfit: 2 samples, r=1, 高 LR, 多 epoch"
+echo ">>> overfit: 2 samples, r=5 (FIXED), mse + sqrt_mean"
+if [ "${NPROC_PER_NODE}" -gt 1 ]; then
+    : "${DDP_FIND_UNUSED_PARAMETERS:=true}"
+    echo ">>> launch: NPROC_PER_NODE=${NPROC_PER_NODE}, CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    echo ">>> ddp_find_unused_parameters=${DDP_FIND_UNUSED_PARAMETERS}"
+    LAUNCH_ENV=("NPROC_PER_NODE=${NPROC_PER_NODE}" "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}")
+else
+    : "${DDP_FIND_UNUSED_PARAMETERS:=false}"
+    echo ">>> launch: single process device_map, CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    LAUNCH_ENV=("CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}")
+fi
 echo ">>> scheduler: cosine, warmup_ratio=${WARMUP_RATIO}"
 echo ">>> train: max_steps=${MAX_STEPS}"
+echo ">>> colar: fixed_r=${COLAR_FIXED_R}, embed_loss=${COLAR_EMBED_LOSS}, sqrt_mean=${COLAR_SQRT_MEAN}, deterministic=${COLAR_DETERMINISTIC}"
+echo ">>> dataset: ${DATASET_PATH}"
+echo ">>> output_dir: ${OUTPUT_DIR}/overfit_ckpt_r5"
 echo ">>> checkpoint: every ${SAVE_STEPS} steps, keep ${SAVE_TOTAL_LIMIT}, save_only_model=${SAVE_ONLY_MODEL}"
 
+env "${LAUNCH_ENV[@]}" \
 swift sft \
     --model                        "${MODEL_PATH}" \
     --model_type                   qwen3_omni_moe \
@@ -67,8 +91,8 @@ swift sft \
     --freeze_vit                   true \
     --freeze_aligner               true \
     \
-    --output_dir                   "${OUTPUT_DIR}/overfit_ckpt" \
-    --num_train_epochs             60 \
+    --output_dir                   "${OUTPUT_DIR}/overfit_ckpt_r5" \
+    --num_train_epochs             600 \
     --max_steps                    "${MAX_STEPS}" \
     --per_device_train_batch_size  1 \
     --gradient_accumulation_steps  1 \
@@ -78,6 +102,7 @@ swift sft \
     --weight_decay                 0.0 \
     --gradient_checkpointing       true \
     --padding_free                 false \
+    --ddp_find_unused_parameters   "${DDP_FIND_UNUSED_PARAMETERS}" \
     \
     --logging_steps                1 \
     --logging_first_step           true \
@@ -85,8 +110,6 @@ swift sft \
     --save_steps                   "${SAVE_STEPS}" \
     --save_total_limit             "${SAVE_TOTAL_LIMIT}" \
     --save_only_model              "${SAVE_ONLY_MODEL}" \
-    --report_to                    tensorboard \
-    \
     --dataloader_num_workers       1
 
-echo ">>> overfit 完成"
+echo ">>> overfit (r=5) 完成"

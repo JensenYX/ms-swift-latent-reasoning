@@ -16,7 +16,10 @@
 #   - train/embed_loss（高斯 NLL）持续下降甚至变负，正常，不作判据。
 #   - train/r 应恒为 2.0（确认 FIXED_R 生效）。
 #
-# 用法: bash overfit_check_r2.sh
+# 用法:
+#   bash overfit_check_r2.sh              # 默认 NPROC_PER_NODE=4
+#   NPROC_PER_NODE=2 bash overfit_check_r2.sh
+#   NPROC_PER_NODE=1 bash overfit_check_r2.sh
 # =============================================================================
 set -e
 
@@ -26,25 +29,60 @@ conda activate "${CONDA_ENV}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL_PATH=/apdcephfs_tj6/share_303840540/hunyuan/jensenwang/model_warehouse/Qwen3-Omni-30B-A3B-Instruct
-OUTPUT_DIR=${SCRIPT_DIR}/output/qwen3omni_colar
-DATASET_PATH=${OUTPUT_DIR}/overfit_text.jsonl
+: "${OUTPUT_DIR:=${SCRIPT_DIR}/output/qwen3omni_colar_r2_fix}"
+: "${DATASET_PATH:=${SCRIPT_DIR}/output/qwen3omni_colar/overfit_text.jsonl}"
 PLUGIN=${SCRIPT_DIR}/colar_plugin/plugin.py
 
 # ── CoLaR 超参：r 钉死为 2（COLAR_FIXED_R 覆盖随机采样）。其余对齐 r=1 自检 ──
 # latent head 非确定性（log_std 可学）；deterministic=1 + nll 是病态组合，勿用。
-export COLAR_MAX_R=2
-export COLAR_FIXED_R=2
-export COLAR_CE_WEIGHT=1.0
-export COLAR_EMBED_WEIGHT=1.0
-export COLAR_ENTROPY_WEIGHT=0.0
-export COLAR_EMBED_LOSS=nll
-export COLAR_DETERMINISTIC=0
+: "${COLAR_MAX_R:=2}"
+: "${COLAR_FIXED_R:=2}"
+: "${COLAR_CE_WEIGHT:=1.0}"
+: "${COLAR_EMBED_WEIGHT:=1.0}"
+: "${COLAR_ENTROPY_WEIGHT:=0.0}"
+: "${COLAR_EMBED_LOSS:=nll}"
+: "${COLAR_DETERMINISTIC:=0}"
+: "${COLAR_SQRT_MEAN:=0}"
+export COLAR_MAX_R
+export COLAR_FIXED_R
+export COLAR_CE_WEIGHT
+export COLAR_EMBED_WEIGHT
+export COLAR_ENTROPY_WEIGHT
+export COLAR_EMBED_LOSS
+export COLAR_DETERMINISTIC
+export COLAR_SQRT_MEAN
 
-# 单进程多卡 device_map（30B 单卡放不下）；不要设 NPROC_PER_NODE
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# 默认用 4 个 DDP rank；8 卡 + NPROC_PER_NODE=4 => 每个 rank 内 2 卡 device_map。
+: "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"
+: "${NPROC_PER_NODE:=4}"
+: "${SAVE_STEPS:=50}"
+: "${SAVE_TOTAL_LIMIT:=3}"
+: "${SAVE_ONLY_MODEL:=true}"
+: "${WARMUP_RATIO:=0.05}"
+: "${MAX_STEPS:=600}"
+export CUDA_VISIBLE_DEVICES
 
 echo ">>> overfit: 2 samples, r=2 (FIXED), 高 LR, 多 epoch"
+if [ "${NPROC_PER_NODE}" -gt 1 ]; then
+    # Qwen3-Omni-MoE + LoRA 是稀疏路由；某些专家 LoRA 参数在某个 rank/step
+    # 天然不会被用到，DDP 不开 unused-parameter 检测会在第二步报 reduction 未完成。
+    : "${DDP_FIND_UNUSED_PARAMETERS:=true}"
+    echo ">>> launch: NPROC_PER_NODE=${NPROC_PER_NODE}, CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    echo ">>> ddp_find_unused_parameters=${DDP_FIND_UNUSED_PARAMETERS}"
+    LAUNCH_ENV=("NPROC_PER_NODE=${NPROC_PER_NODE}" "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}")
+else
+    : "${DDP_FIND_UNUSED_PARAMETERS:=false}"
+    echo ">>> launch: single process device_map, CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    LAUNCH_ENV=("CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}")
+fi
+echo ">>> scheduler: cosine, warmup_ratio=${WARMUP_RATIO}"
+echo ">>> train: max_steps=${MAX_STEPS}"
+echo ">>> colar: fixed_r=${COLAR_FIXED_R}, embed_loss=${COLAR_EMBED_LOSS}, sqrt_mean=${COLAR_SQRT_MEAN}, deterministic=${COLAR_DETERMINISTIC}"
+echo ">>> dataset: ${DATASET_PATH}"
+echo ">>> output_dir: ${OUTPUT_DIR}/overfit_ckpt_r2"
+echo ">>> checkpoint: every ${SAVE_STEPS} steps, keep ${SAVE_TOTAL_LIMIT}, save_only_model=${SAVE_ONLY_MODEL}"
 
+env "${LAUNCH_ENV[@]}" \
 swift sft \
     --model                        "${MODEL_PATH}" \
     --model_type                   qwen3_omni_moe \
@@ -68,21 +106,24 @@ swift sft \
     --freeze_aligner               true \
     \
     --output_dir                   "${OUTPUT_DIR}/overfit_ckpt_r2" \
-    --num_train_epochs             60 \
+    --num_train_epochs             600 \
+    --max_steps                    "${MAX_STEPS}" \
     --per_device_train_batch_size  1 \
     --gradient_accumulation_steps  1 \
     --learning_rate                5e-4 \
-    --lr_scheduler_type            constant \
-    --warmup_ratio                 0.0 \
+    --lr_scheduler_type            cosine \
+    --warmup_ratio                 "${WARMUP_RATIO}" \
     --weight_decay                 0.0 \
     --gradient_checkpointing       true \
     --padding_free                 false \
+    --ddp_find_unused_parameters   "${DDP_FIND_UNUSED_PARAMETERS}" \
     \
     --logging_steps                1 \
     --logging_first_step           true \
-    --save_strategy                no \
-    --report_to                    tensorboard \
-    \
+    --save_strategy                steps \
+    --save_steps                   "${SAVE_STEPS}" \
+    --save_total_limit             "${SAVE_TOTAL_LIMIT}" \
+    --save_only_model              "${SAVE_ONLY_MODEL}" \
     --dataloader_num_workers       1
 
 echo ">>> overfit (r=2) 完成"
