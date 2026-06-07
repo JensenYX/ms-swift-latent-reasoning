@@ -22,6 +22,7 @@ from swift.tuners import Swift
 
 from .colar_template import THINK_CLOSE_ID, THINK_OPEN_ID
 from .latent_policy import LatentPolicy
+from .qwen3omni_audio import merge_audio_embeds, resolve_audio_token_id
 
 
 @dataclass
@@ -130,23 +131,56 @@ class ColarLatentGenerator:
         self.text_device = _text_input_device(self.text_model)
         self.lm_head_device = self.lm_head.weight.device
         self.lp_device = next(latent_policy.parameters()).device
+        self.audio_token_id = resolve_audio_token_id(self.thinker, self.tokenizer, model)
 
-    def _encode_prompt(self, messages: List[Dict[str, Any]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _encode_prompt(
+        self,
+        messages: List[Dict[str, Any]],
+        audios: Optional[List[str]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         self.template.set_mode('transformers')
         encoded = self.template.encode(
             InferRequest(
                 messages=messages,
+                audios=audios or [],
                 chat_template_kwargs={'enable_thinking': True},
             ))
         input_ids = torch.tensor([encoded['input_ids']], device=self.embed_device, dtype=torch.long)
         attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-        return input_ids, attention_mask
+        input_features = encoded.get('input_features')
+        feature_attention_mask = encoded.get('feature_attention_mask')
+        if input_features is not None:
+            input_features = input_features.to(self.embed_device)
+        if feature_attention_mask is not None:
+            feature_attention_mask = feature_attention_mask.to(self.embed_device)
+        return input_ids, attention_mask, input_features, feature_attention_mask
+
+    def _build_prompt_embeds(
+        self,
+        input_ids: torch.Tensor,
+        input_features: Optional[torch.Tensor],
+        feature_attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        inputs_embeds = self.embed_tokens(input_ids)
+        return merge_audio_embeds(
+            thinker=self.thinker,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
+            audio_token_id=self.audio_token_id,
+        )
 
     @torch.inference_mode()
-    def latent_generate(self, messages: List[Dict[str, Any]]) -> Tuple[str, int, bool]:
+    def latent_generate(
+        self,
+        messages: List[Dict[str, Any]],
+        audios: Optional[List[str]] = None,
+    ) -> Tuple[str, int, bool]:
         cfg = self.config
-        input_ids, attention_mask = self._encode_prompt(messages)
-        question_embeds = self.embed_tokens(input_ids).to(self.text_device)
+        input_ids, attention_mask, input_features, feature_attention_mask = self._encode_prompt(messages, audios)
+        question_embeds = self._build_prompt_embeds(input_ids, input_features, feature_attention_mask).to(
+            self.text_device)
         attention_mask = attention_mask.to(self.text_device)
         position_ids = _position_ids_from_mask(attention_mask)
 

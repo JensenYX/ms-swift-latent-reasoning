@@ -122,7 +122,7 @@ def iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
                 raise ValueError(f"Invalid JSONL at {path}:{line_no}: {e}") from e
 
 
-def split_prompt_and_expected(record: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def split_prompt_and_expected(record: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str], List[str]]:
     messages = record.get("messages") or []
     prompt_messages: List[Dict[str, Any]] = []
     expected = None
@@ -130,10 +130,22 @@ def split_prompt_and_expected(record: Dict[str, Any]) -> Tuple[List[Dict[str, An
         if message.get("role") == "assistant":
             expected = message.get("content")
             break
-        prompt_messages.append(message)
+        prompt_messages.append(dict(message))
     if not prompt_messages:
-        prompt_messages = messages
-    return prompt_messages, expected
+        prompt_messages = [dict(message) for message in messages]
+    audios = record.get("audios") or []
+    if isinstance(audios, str):
+        audios = [audios]
+    if not audios:
+        audios = [m.get("wav_path", "").strip() for m in prompt_messages if m.get("wav_path")]
+        audios = [p for p in audios if p]
+        if audios:
+            for message in prompt_messages:
+                message.pop("wav_path", None)
+            user_messages = [m for m in prompt_messages if m.get("role") == "user"]
+            if len(user_messages) == 1 and "<audio>" not in str(user_messages[0].get("content", "")):
+                user_messages[0]["content"] = "<audio>"
+    return prompt_messages, expected, audios
 
 
 def normalize_text(text: Optional[str]) -> str:
@@ -247,15 +259,16 @@ def build_latent_generator(args, checkpoint: Path, ckpt_args: Dict[str, Any], pl
     )
 
 
-def run_text_inference(args, checkpoint, ckpt_args, records, prompts, expected, output):
+def run_text_inference(args, checkpoint, ckpt_args, records, prompts, expected, audios_list, output):
     from swift.infer_engine import InferRequest, RequestConfig
 
     engine = build_text_engine(args, checkpoint, ckpt_args)
     requests = []
-    for prompt in prompts:
+    for prompt, audios in zip(prompts, audios_list):
         requests.append(
             InferRequest(
                 messages=prompt,
+                audios=audios,
                 chat_template_kwargs={"enable_thinking": not args.disable_thinking},
             ))
     request_config = RequestConfig(
@@ -273,7 +286,7 @@ def run_text_inference(args, checkpoint, ckpt_args, records, prompts, expected, 
 
     n_answer_match = 0
     with output.open("w", encoding="utf-8") as f:
-        for idx, (prompt, exp, resp) in enumerate(zip(prompts, expected, responses)):
+        for idx, (prompt, exp, audios, resp) in enumerate(zip(prompts, expected, audios_list, responses)):
             if isinstance(resp, Exception):
                 response_text = ""
                 error = repr(resp)
@@ -291,6 +304,7 @@ def run_text_inference(args, checkpoint, ckpt_args, records, prompts, expected, 
                 "idx": idx,
                 "mode": "text",
                 "prompt_messages": prompt,
+                "audios": audios,
                 "expected": exp,
                 "response": response_text,
                 "match": flags,
@@ -308,20 +322,20 @@ def run_text_inference(args, checkpoint, ckpt_args, records, prompts, expected, 
         print(f"[infer:text] sample {i} response head: {resp.choices[0].message.content[:500]!r}")
 
 
-def run_latent_inference(args, checkpoint, ckpt_args, plugin, records, prompts, expected, output):
+def run_latent_inference(args, checkpoint, ckpt_args, plugin, records, prompts, expected, audios_list, output):
     generator = build_latent_generator(args, checkpoint, ckpt_args, plugin)
 
     n_answer_match = 0
     n_eol_hit = 0
     errors = []
     with output.open("w", encoding="utf-8") as f:
-        for idx, (prompt, exp) in enumerate(zip(prompts, expected)):
+        for idx, (prompt, exp, audios) in enumerate(zip(prompts, expected, audios_list)):
             error = None
             response_text = ""
             n_latent_forward = 0
             hit_eol = False
             try:
-                response_text, n_latent_forward, hit_eol = generator.latent_generate(prompt)
+                response_text, n_latent_forward, hit_eol = generator.latent_generate(prompt, audios=audios)
                 n_eol_hit += int(hit_eol)
             except Exception as e:
                 error = repr(e)
@@ -333,6 +347,7 @@ def run_latent_inference(args, checkpoint, ckpt_args, plugin, records, prompts, 
                 "idx": idx,
                 "mode": "latent",
                 "prompt_messages": prompt,
+                "audios": audios,
                 "expected": exp,
                 "response": response_text,
                 "n_latent_forward": n_latent_forward,
@@ -394,18 +409,20 @@ def run_inference(args) -> None:
 
     prompts = []
     expected = []
+    audios_list = []
     for record in records:
-        prompt, exp = split_prompt_and_expected(record)
+        prompt, exp, audios = split_prompt_and_expected(record)
         prompts.append(prompt)
         expected.append(exp)
+        audios_list.append(audios)
 
     output = _canonicalize_path(args.output) or Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
 
     if args.mode == "text":
-        run_text_inference(args, checkpoint, ckpt_args, records, prompts, expected, output)
+        run_text_inference(args, checkpoint, ckpt_args, records, prompts, expected, audios_list, output)
     else:
-        run_latent_inference(args, checkpoint, ckpt_args, plugin, records, prompts, expected, output)
+        run_latent_inference(args, checkpoint, ckpt_args, plugin, records, prompts, expected, audios_list, output)
 
 
 def parse_args():

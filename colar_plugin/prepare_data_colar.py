@@ -49,7 +49,7 @@ def _think_wrap(reasoning: str, answer: str) -> str:
     return answer
 
 
-def convert(raw_paths: List[str], out_path: str, mode: str) -> None:
+def convert(raw_paths: List[str], out_path: str, mode: str, limit: int = 0) -> None:
     assert mode in ('text', 'audio')
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
@@ -101,6 +101,10 @@ def convert(raw_paths: List[str], out_path: str, mode: str) -> None:
                         }
                     fout.write(json.dumps(record, ensure_ascii=False) + '\n')
                     n_written += 1
+                    if limit > 0 and n_written >= limit:
+                        break
+            if limit > 0 and n_written >= limit:
+                break
 
     print(f'[prepare_data_colar] mode={mode} 写入 {n_written} 条 '
           f'(跳过非单轮 {n_skipped} 条, 无 reasoning {n_no_think} 条) -> {out_path}')
@@ -119,11 +123,12 @@ def main():
     ap.add_argument('--raw', nargs='+', required=True, help='原始 jsonl，可多个或用通配符')
     ap.add_argument('--out', required=True, help='输出 jsonl 路径')
     ap.add_argument('--mode', choices=['text', 'audio'], default='text')
+    ap.add_argument('--limit', type=int, default=0, help='最多写入 N 条；0 表示不限制')
     args = ap.parse_args()
     raw_paths = _expand(args.raw)
     assert raw_paths, f'no input files matched: {args.raw}'
     print(f'[prepare_data_colar] inputs ({len(raw_paths)}): {raw_paths}')
-    convert(raw_paths, args.out, args.mode)
+    convert(raw_paths, args.out, args.mode, args.limit)
 
 
 if __name__ == '__main__':

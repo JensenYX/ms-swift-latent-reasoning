@@ -48,6 +48,7 @@ from swift.utils import get_logger
 
 from .latent_policy import LatentPolicy, compute_embeds_std
 from .colar_template import THINK_OPEN_ID, THINK_CLOSE_ID
+from .qwen3omni_audio import merge_audio_embeds, resolve_audio_token_id
 
 logger = get_logger()
 
@@ -97,6 +98,7 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
         self._text_model = thinker.model          # Qwen3OmniMoeThinkerTextModel（文本主干）
         self._lm_head = thinker.lm_head
         self._embed_tokens = thinker.get_input_embeddings()
+        self._audio_token_id = resolve_audio_token_id(thinker, self.tokenizer, base_model)
 
         hidden_size = self._embed_tokens.weight.shape[1]
         self.colar_hidden_size = hidden_size
@@ -203,14 +205,29 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
         input_ids = inputs['input_ids']             # [B, L]
         labels = inputs.pop('labels')               # [B, L]，前缀已 -100
         attention_mask = inputs.get('attention_mask')
+        input_features = inputs.pop('input_features', None)
+        feature_attention_mask = inputs.pop('feature_attention_mask', None)
+        # CoLaR 目前只支持 audio/text。image/video 字段不应进入文本主干。
+        for mm_key in (
+                'pixel_values',
+                'pixel_values_videos',
+                'image_grid_thw',
+                'video_grid_thw',
+                'video_second_per_grid',
+                'audio_feature_lengths',
+                'rope_deltas',
+                'use_audio_in_video',
+                'cache_position',
+        ):
+            inputs.pop(mm_key, None)
         if attention_mask is None:
             attention_mask = (input_ids != self.colar_pad_id).long()
 
         device = input_ids.device
 
-        # 1) 基础 embedding（里程碑1纯文本：直接查表）
-        #    里程碑2：在此后插入 audio_tower -> masked_scatter（见 plan M2.1）
-        base_embeds = self._embed_tokens(input_ids)  # [B, L, H]
+        # 1) 基础 embedding。纯文本仍是直接查表；音频样本需要把 Qwen3-Omni
+        #    audio tower 输出 scatter 到展开后的 <|audio_pad|> token 位置。
+        base_embeds = self._build_base_embeds(input_ids, input_features, feature_attention_mask)  # [B, L, H]
 
         # 2) 采样压缩率
         #    COLAR_FIXED_R>0 时把 r 钉死（overfit 自检/调试用，曲线不抖、可复现）；
@@ -287,6 +304,22 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
         return outputs['loss']   # HF Trainer 要求 loss 回到原始输入设备（cuda:0）
 
     # ---------- 工具 ----------
+    def _build_base_embeds(
+        self,
+        input_ids: torch.Tensor,
+        input_features: Optional[torch.Tensor],
+        feature_attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        base_embeds = self._embed_tokens(input_ids)
+        return merge_audio_embeds(
+            thinker=self._thinker,
+            input_ids=input_ids,
+            inputs_embeds=base_embeds,
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
+            audio_token_id=self._audio_token_id,
+        )
+
     def _build_think_mask(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """think_mask[b,t]=1 当 t 落在 <think> 与 </think> 之间（不含两端标记本身）。"""
         B, L = input_ids.shape

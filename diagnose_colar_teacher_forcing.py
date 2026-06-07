@@ -217,7 +217,7 @@ def diagnose_one(generator, record: Dict[str, Any], idx: int, r: int, top_k: int
     lm_head = generator.lm_head
     latent_policy = generator.latent_policy
 
-    prompt_messages, expected = split_prompt_and_expected(record)
+    prompt_messages, expected, _audios = split_prompt_and_expected(record)
     path, debug = build_compressed_path(generator, record, r)
 
     prompt_ids = _encode_infer_prompt(generator.template, prompt_messages)

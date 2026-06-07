@@ -1,6 +1,6 @@
 # Qwen3-Omni CoLaR Latent Reasoning 进展总结
 
-更新时间：2026-06-07
+更新时间：2026-06-08
 
 仓库：
 
@@ -14,7 +14,7 @@
 /apdcephfs_tj6/share_303840540/hunyuan/jensenwang/git_warehouse/colar
 ```
 
-目标：把 CoLaR latent reasoning 方法迁移到 Qwen3-Omni。当前 overfit 检查只做纯 text 输入、纯 text 输出，不涉及音频。
+目标：把 CoLaR latent reasoning 方法迁移到 Qwen3-Omni。此前 overfit 检查已打通纯 text 输入、纯 text 输出；2026-06-07 已新增并验证 audio input -> text output 的 overfit 链路。
 
 ## 当前核心结论
 
@@ -47,7 +47,125 @@ answer-ish matches: 2/2
 eol hits: 2/2
 ```
 
-6. 这说明之前不是简单的 label/prompt/checkpoint 加载 bug，而主要是训练目标/压缩归一化/采样方式导致 free rollout 不稳定。
+6. audio input -> text output 的 r=5 overfit 也已成功。当前 audio 数据集 4 行，实际是两个 overfit 样本各重复一次，用来满足 `NPROC_PER_NODE=4` 时每个 rank 至少有样本：
+
+```text
+checkpoint: output/qwen3omni_colar_audio_r5_mse_sqrt/overfit_ckpt_audio_r5/v1-20260607-135625/checkpoint-300
+infer output: output/qwen3omni_colar_audio_r5_mse_sqrt/overfit_infer_audio_r5.jsonl
+sample 0: n_latent_forward=94, hit_eol=True, answer_response_in_expected=True
+sample 1: n_latent_forward=356, hit_eol=True, answer_response_in_expected=True
+sample 2: n_latent_forward=94, hit_eol=True, answer_response_in_expected=True
+sample 3: n_latent_forward=356, hit_eol=True, answer_response_in_expected=True
+answer-ish matches: 4/4
+eol hits: 4/4
+```
+
+7. 这说明之前不是简单的 label/prompt/checkpoint 加载 bug，而主要是训练目标/压缩归一化/采样方式导致 free rollout 不稳定。
+
+## Audio input -> text output 新增进展
+
+2026-06-07 已在不改变纯文本默认路径的前提下接入音频输入：
+
+- `colar_plugin/qwen3omni_audio.py` 新增 Qwen3-Omni audio embedding helper。
+- `colar_plugin/colar_trainer.py` 在存在 `input_features` 时调用 `thinker.get_audio_features(...)`，并把输出 scatter 到展开后的 `<|audio_pad|>` token；无音频时仍直接 `embed_tokens(input_ids)`。
+- `colar_plugin/colar_infer.py` 的 latent inference 支持 `InferRequest(..., audios=[...])`，首段 prompt embedding 会合并 audio tower 输出；latent rollout 和 answer decode 仍沿用文本主干 KV cache。
+- `infer_qwen3omni_colar_overfit.py` 会从顶层 `audios` 或 user message 里的 `wav_path` 识别音频输入。
+- 新增 `overfit_check_audio_r5.sh` 和 `infer_overfit_check_audio_r5.sh`，默认复用 r=5 成功配置 `mse + sqrt_mean + sampling`。
+- `colar_plugin/prepare_data_colar.py` 已支持 `--mode audio --limit N`。
+
+已完成检查：
+
+```text
+python -m py_compile ... 通过
+bash -n overfit_check_audio_r5.sh / infer_overfit_check_audio_r5.sh 通过
+template encode 音频样本通过：
+  input_ids_len=57
+  n_audio_tokens=45
+  input_features_shape=(1, 128, 344)
+  feature_attention_mask_shape=(1, 344)
+  last_tokens 包含 <think>\n
+```
+
+注意：当前执行环境里 `librosa/numba` 需要可写 cache，所以音频脚本默认设置：
+
+```text
+NUMBA_CACHE_DIR=/tmp/numba_cache_colar
+```
+
+audio overfit 训练和推理已完成：
+
+```text
+训练：300/300 step 完成，最后 ce_loss ~= 0.1969，embed_loss ~= 0.00219
+推理：LIMIT=4 bash infer_overfit_check_audio_r5.sh
+结果：answer-ish matches 4/4，eol hits 4/4
+```
+
+## Mixed audio/text overfit 准备
+
+2026-06-08 用户把 `overfit_data.jsonl` 改成音频和纯文本混合数据。已生成新的 mixed dataset，避免覆盖前面 audio-only 成功实验：
+
+```text
+dataset: output/qwen3omni_colar/overfit_mixed_audio_text.jsonl
+logical rows: 4
+row 0: audio, user content=<audio>
+row 1: audio, user content=<audio>
+row 2: text, user content=原始文本问题
+row 3: audio, user content=<audio>
+```
+
+转换逻辑来自 `prepare_data_colar.py --mode audio`：
+
+```text
+有 wav_path 的样本 -> user content 替换为 <audio>，顶层 audios=[wav_path]
+没有 wav_path 的样本 -> 保留 user 原始文本，不写 audios 字段
+assistant 都保持 <think>...</think> + answer
+```
+
+`OVERFIT_LIMIT=0` 表示不截断样本，导出所有可用记录；`OVERFIT_LIMIT=2/4` 才表示只取前 2/4 条。这里使用 `0` 是为了避免脚本默认值 `2` 把 mixed 数据截成前两条 audio-only。
+
+用户本地启动 mixed r=5 训练建议使用：
+
+```bash
+DATASET_PATH=/apdcephfs_tj6/share_303840540/hunyuan/jensenwang/git_warehouse/ms-swift-latent-reasoning/output/qwen3omni_colar/overfit_mixed_audio_text.jsonl \
+OUTPUT_DIR=/apdcephfs_tj6/share_303840540/hunyuan/jensenwang/git_warehouse/ms-swift-latent-reasoning/output/qwen3omni_colar_mixed_r5_mse_sqrt \
+OVERFIT_LIMIT=0 \
+NPROC_PER_NODE=4 \
+bash overfit_check_audio_r5.sh
+```
+
+训练完成后推理建议使用：
+
+```bash
+CHECKPOINT_ROOT=output/qwen3omni_colar_mixed_r5_mse_sqrt/overfit_ckpt_audio_r5 \
+DATASET=output/qwen3omni_colar/overfit_mixed_audio_text.jsonl \
+OUTPUT=output/qwen3omni_colar_mixed_r5_mse_sqrt/overfit_infer_mixed_r5.jsonl \
+LIMIT=4 \
+bash infer_overfit_check_audio_r5.sh
+```
+
+注意：不要直接无参数运行 `bash overfit_check_audio_r5.sh` 来做 mixed 实验；脚本默认 `DATASET_PATH` 仍是 `output/qwen3omni_colar/overfit_audio.jsonl`，会复用旧 audio-only 数据集。
+
+2026-06-08 另增 mixed r=10 脚本，默认已指向 mixed dataset 和独立输出目录：
+
+```text
+train script: overfit_check_audio_r10.sh
+infer script: infer_overfit_check_audio_r10.sh
+dataset: output/qwen3omni_colar/overfit_mixed_audio_text.jsonl
+output dir: output/qwen3omni_colar_mixed_r10_mse_sqrt
+checkpoint dir: output/qwen3omni_colar_mixed_r10_mse_sqrt/overfit_ckpt_audio_r10
+```
+
+r=10 训练：
+
+```bash
+bash overfit_check_audio_r10.sh
+```
+
+r=10 推理：
+
+```bash
+LIMIT=4 bash infer_overfit_check_audio_r10.sh
+```
 
 ## 关键代码文件
 
