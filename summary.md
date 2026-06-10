@@ -1,6 +1,6 @@
 # Qwen3-Omni CoLaR Latent Reasoning 进展总结
 
-更新时间：2026-06-08
+更新时间：2026-06-09
 
 仓库：
 
@@ -60,7 +60,21 @@ answer-ish matches: 4/4
 eol hits: 4/4
 ```
 
-7. 这说明之前不是简单的 label/prompt/checkpoint 加载 bug，而主要是训练目标/压缩归一化/采样方式导致 free rollout 不稳定。
+7. mixed audio/text 的 r=5 和 r=10 推理也已完成，整体基本成功：
+
+```text
+mixed r=5:
+  answer_response_in_expected: 4/4
+  eol hits: 3/4
+  未停样本: idx=1，中文化学音频样本，n_latent_forward=400, hit_eol=False
+  该样本虽然没有正确预测停止，但 response 仍是 gold answer 的前缀。
+
+mixed r=10:
+  answer_response_in_expected: 4/4
+  eol hits: 4/4
+```
+
+8. 这说明之前不是简单的 label/prompt/checkpoint 加载 bug，而主要是训练目标/压缩归一化/采样方式导致 free rollout 不稳定。
 
 ## Audio input -> text output 新增进展
 
@@ -100,7 +114,7 @@ audio overfit 训练和推理已完成：
 结果：answer-ish matches 4/4，eol hits 4/4
 ```
 
-## Mixed audio/text overfit 准备
+## Mixed audio/text overfit 准备与结果
 
 2026-06-08 用户把 `overfit_data.jsonl` 改成音频和纯文本混合数据。已生成新的 mixed dataset，避免覆盖前面 audio-only 成功实验：
 
@@ -166,6 +180,44 @@ r=10 推理：
 ```bash
 LIMIT=4 bash infer_overfit_check_audio_r10.sh
 ```
+
+2026-06-08 mixed r=5 和 r=10 推理都已完成。
+
+mixed r=5：
+
+```text
+checkpoint: output/qwen3omni_colar_mixed_r5_mse_sqrt/overfit_ckpt_audio_r5/v0-20260607-235138/checkpoint-300
+infer output: output/qwen3omni_colar_mixed_r5_mse_sqrt/overfit_infer_mixed_r5.jsonl
+训练 step 300: ce_loss ~= 0.3054, embed_loss ~= 0.00618, r = 5.0
+
+idx 0: audio, n_latent_forward=94, hit_eol=True, answer_response_in_expected=True
+idx 1: audio, n_latent_forward=400, hit_eol=False, answer_response_in_expected=True
+idx 2: text,  n_latent_forward=121, hit_eol=True, answer_response_in_expected=True
+idx 3: audio, n_latent_forward=104, hit_eol=True, answer_response_in_expected=True
+
+answer_response_in_expected: 4/4
+eol hits: 3/4
+```
+
+mixed r=5 唯一未正确停止的是 `idx=1` 中文化学音频样本。它跑满了 `MAX_LATENT_FORWARD=400`，但生成答案仍是 gold answer 的前缀，因此可视为答案 overfit 成功、停止预测存在一例 free rollout/EOL miss。
+
+mixed r=10：
+
+```text
+checkpoint: output/qwen3omni_colar_mixed_r10_mse_sqrt/overfit_ckpt_audio_r10/v0-20260608-003027/checkpoint-300
+infer output: output/qwen3omni_colar_mixed_r10_mse_sqrt/overfit_infer_mixed_r10.jsonl
+训练 step 300: ce_loss ~= 0.2440, embed_loss ~= 0.00263, r = 10.0
+
+idx 0: audio, n_latent_forward=47, hit_eol=True, answer_response_in_expected=True
+idx 1: audio, n_latent_forward=178, hit_eol=True, answer_response_in_expected=True
+idx 2: text,  n_latent_forward=61, hit_eol=True, answer_response_in_expected=True
+idx 3: audio, n_latent_forward=52, hit_eol=True, answer_response_in_expected=True
+
+answer_response_in_expected: 4/4
+eol hits: 4/4
+```
+
+对比 r=5，r=10 在这个 mixed overfit 集合上停止预测更稳，4 条样本全部 hit `</think>`，且 latent 步数约为 r=5 的一半。
 
 ## 关键代码文件
 
@@ -639,3 +691,719 @@ eol_temperature: 1.0
 ```
 
 这与成功的 r=2 迁移实验一致。
+
+## 2026-06-09 Query-anchor / Res-CoLaR 实验记录
+
+动机：当前 baseline CoLaR 已能在 Qwen3-Omni mixed audio/text overfit 上跑通，但 Qwen3-Omni 的 CoT 很长，latent rollout 较长时仍有 exposure bias 风险。因此新增一个独立 query-anchor 实验路径，尝试在 latent reasoning 阶段引入 query hidden 作为稳定条件。
+
+新增文件均为独立实验路径，没有覆盖 baseline CoLaR 代码：
+
+```text
+colar_plugin/query_anchor_policy.py
+colar_plugin/query_anchor_trainer.py
+colar_plugin/query_anchor_plugin.py
+colar_plugin/query_anchor_infer.py
+infer_qwen3omni_query_anchor_overfit.py
+overfit_check_query_anchor_audio_r5.sh
+overfit_check_query_anchor_audio_r10.sh
+infer_overfit_check_query_anchor_audio_r5.sh
+infer_overfit_check_query_anchor_audio_r10.sh
+```
+
+核心实现：
+
+```text
+1. latent head 可条件化：
+   latent_head input = [h_t, q, h_t * q]
+
+2. residual anchor 可选：
+   anchored_latent = (latent + alpha * query_anchor) / sqrt(1 + alpha^2)
+
+3. 训练 target 仍是 clean compressed latent：
+   gold = gold_source[t+1] / embeds_std
+   不把 query anchor 加到 latent target 里。
+
+4. inference 仍使用 KV cache：
+   prompt forward use_cache=True
+   每个 latent step 只喂一个 latent embedding + past_key_values
+```
+
+重要配置：
+
+```text
+QUERY_ANCHOR_CONDITION_HEAD=1  # latent head 看到 query hidden
+QUERY_ANCHOR_RESIDUAL=1/0      # 是否把 query residual 加回 latent input
+QUERY_ANCHOR_RESIDUAL_SOURCE=hidden/embed
+QUERY_ANCHOR_HIDDEN_SOURCE=prompt_last/user_last
+QUERY_ANCHOR_GATE_INIT=0.1
+QUERY_ANCHOR_NOISE_STD=0.0
+GRADIENT_CHECKPOINTING=false   # hidden-source 版本建议关闭
+```
+
+关于 `QUERY_ANCHOR_HIDDEN_SOURCE`：
+
+```text
+prompt_last:
+  取整个 prompt 的最后一个 token hidden，通常是 <think>\n 的换行 token。
+  这和 latent rollout 第一步的起点天然对齐。
+
+user_last:
+  取 user turn 最后一个 token hidden。
+  纯文本样本中是题目最后一个 token；
+  音频样本中实际是 <|audio_end|>，因为 user content=<audio> 会展开成
+  <|audio_start|><|audio_pad|>...<|audio_end|>。
+```
+
+已确认音频 encode 细节：
+
+```text
+idx 0 audio:
+  audio_pad_count=45
+  audio_pad_range=4..48
+  user_last anchor=<|audio_end|> at pos 49
+
+idx 1 audio:
+  audio_pad_count=257
+  audio_pad_range=4..260
+  user_last anchor=<|audio_end|> at pos 261
+
+idx 2 text:
+  user_last anchor=题目最后一个 token "统一"
+
+idx 3 audio:
+  audio_pad_count=118
+  audio_pad_range=4..121
+  user_last anchor=<|audio_end|> at pos 122
+```
+
+因此，音频样本的 `user_last` hidden 理论上能 attend 到前面的 audio soft tokens，但它本身是音频结束符，不一定是最好的 query summary。
+
+### Query-anchor 已完成实验
+
+#### A. hidden residual 版本，旧 full run
+
+checkpoint:
+
+```text
+output/qwen3omni_query_anchor_hidden_r5_mse_sqrt/overfit_ckpt_audio_r5/v0-20260608-192850/checkpoint-300
+```
+
+注意：该 checkpoint 的 `colar_config.json` 没有 `query_anchor_hidden_source` 字段，因为当时代码尚未显式保存该字段；按旧逻辑，它等价于 `prompt_last`。
+
+配置摘要：
+
+```text
+query_anchor_condition_head=true
+query_anchor_residual=true
+query_anchor_residual_source=hidden
+query_anchor_proj_init=identity
+query_anchor_alpha ~= 0.1086
+query_anchor_noise_std=0.0
+```
+
+推理结果：
+
+```text
+answer-ish matches: 2/4
+eol hits: 2/4
+
+idx 0: audio, hit_eol=True,  n_latent_forward=94,  script match=False
+idx 1: audio, hit_eol=False, n_latent_forward=400, script match=False
+idx 2: text,  hit_eol=True,  n_latent_forward=121, script match=True
+idx 3: audio, hit_eol=False, n_latent_forward=400, script match=False
+```
+
+观察：hidden residual 直接加回 latent embedding 后，训练和推理都比 baseline 更不稳。主要怀疑点是 hidden-state 空间和 compressed embedding/latent 空间未必几何对齐，identity projection + alpha=0.1 可能把 latent 拉出原 manifold。
+
+#### B. condition head only，prompt_last，r=5
+
+训练命令：
+
+```bash
+QUERY_ANCHOR_CONDITION_HEAD=1 \
+QUERY_ANCHOR_RESIDUAL=0 \
+QUERY_ANCHOR_HIDDEN_SOURCE=prompt_last \
+QUERY_ANCHOR_NOISE_STD=0.0 \
+OUTPUT_DIR=output/qwen3omni_query_anchor_condonly_promptlast_r5_mse_sqrt \
+bash overfit_check_query_anchor_audio_r5.sh
+```
+
+checkpoint:
+
+```text
+output/qwen3omni_query_anchor_condonly_promptlast_r5_mse_sqrt/overfit_ckpt_audio_r5/v0-20260608-222109/checkpoint-300
+```
+
+config 摘要：
+
+```text
+query_anchor_condition_head=true
+query_anchor_residual=false
+query_anchor_residual_source=hidden
+query_anchor_hidden_source=prompt_last
+query_anchor_noise_std=0.0
+query_anchor_alpha=0.1  # residual=false 时实际不生效
+```
+
+推理命令：
+
+```bash
+CHECKPOINT_ROOT=output/qwen3omni_query_anchor_condonly_promptlast_r5_mse_sqrt/overfit_ckpt_audio_r5 \
+OUTPUT=output/qwen3omni_query_anchor_condonly_promptlast_r5_mse_sqrt/overfit_infer_query_anchor_r5.jsonl \
+LIMIT=4 \
+MAX_LATENT_FORWARD=400 \
+MAX_NEW_TOKENS=512 \
+LATENT_TEMPERATURE=1.0 \
+EOL_TEMPERATURE=1.0 \
+PROGRESS_EVERY=128 \
+bash infer_overfit_check_query_anchor_audio_r5.sh
+```
+
+推理结果：
+
+```text
+answer-ish matches: 3/4
+eol hits: 2/4
+
+idx 0: audio, n_latent_forward=94,  hit_eol=True,  answer_response_in_expected=True
+idx 1: audio, n_latent_forward=400, hit_eol=False, 内容方向正确但 match=False
+idx 2: text,  n_latent_forward=121, hit_eol=True,  answer_response_in_expected=True
+idx 3: audio, n_latent_forward=400, hit_eol=False, answer_response_in_expected=True
+```
+
+结论：
+
+```text
+condition-only 比 hidden residual 版本更稳：
+  hidden residual:    answer-ish 2/4, eol 2/4
+  condition-only:     answer-ish 3/4, eol 2/4
+
+但仍不如 baseline CoLaR r=5：
+  baseline mixed r=5: answer-ish 4/4, eol 3/4
+```
+
+当前判断：
+
+```text
+1. query hidden 作为 latent head 条件是相对安全的；
+2. 直接把 hidden residual 加回 latent embedding 空间大概率有害；
+3. 当前 query-anchor 的主要剩余问题是停止预测不稳，尤其音频样本容易跑满 MAX_LATENT_FORWARD=400；
+4. 音频 query summary 也可能需要更好的 pooling，而不是只依赖 <|audio_end|> 或 prompt_last 单 token。
+```
+
+下一步建议先不重新训练，直接用 condition-only checkpoint 跑 deterministic inference：
+
+```bash
+CHECKPOINT_ROOT=output/qwen3omni_query_anchor_condonly_promptlast_r5_mse_sqrt/overfit_ckpt_audio_r5 \
+OUTPUT=output/qwen3omni_query_anchor_condonly_promptlast_r5_mse_sqrt/overfit_infer_query_anchor_r5_greedy.jsonl \
+LIMIT=4 \
+MAX_LATENT_FORWARD=400 \
+MAX_NEW_TOKENS=512 \
+LATENT_TEMPERATURE=0 \
+EOL_TEMPERATURE=0 \
+PROGRESS_EVERY=128 \
+bash infer_overfit_check_query_anchor_audio_r5.sh
+```
+
+如果 greedy 后 EOL 明显改善，问题主要是 sampling 放大了停止漂移；如果 greedy 也不行，再考虑训练侧：
+
+```text
+QUERY_ANCHOR_NOISE_STD=0.05/0.1
+或单独加强 EOL/stop 监督
+或新增 user/audio span pooling 的 query anchor
+```
+
+#### B2. condition head only，prompt_last，r=5，greedy inference
+
+推理命令：
+
+```bash
+CHECKPOINT_ROOT=output/qwen3omni_query_anchor_condonly_promptlast_r5_mse_sqrt/overfit_ckpt_audio_r5 \
+OUTPUT=output/qwen3omni_query_anchor_condonly_promptlast_r5_mse_sqrt/overfit_infer_query_anchor_r5_greedy.jsonl \
+LIMIT=4 \
+MAX_LATENT_FORWARD=400 \
+MAX_NEW_TOKENS=512 \
+LATENT_TEMPERATURE=0 \
+EOL_TEMPERATURE=0 \
+PROGRESS_EVERY=128 \
+bash infer_overfit_check_query_anchor_audio_r5.sh
+```
+
+推理结果：
+
+```text
+answer-ish matches: 4/4
+eol hits: 2/4
+
+idx 0: audio, n_latent_forward=94,  hit_eol=True,  answer_match=False, answer_response_in_expected=True
+idx 1: audio, n_latent_forward=400, hit_eol=False, answer_match=False, answer_response_in_expected=True
+idx 2: text,  n_latent_forward=121, hit_eol=True,  answer_match=True
+idx 3: audio, n_latent_forward=400, hit_eol=False, answer_match=True
+```
+
+观察：
+
+```text
+1. greedy 后答案匹配恢复到 4/4，说明 condition-only checkpoint 的答案内容能力并没有完全坏掉；
+2. 但 EOL 仍是 2/4，两个音频样本继续跑满 400 latent step；
+3. 因此停止失败不是单纯由 sampling 随机性导致，而是 free rollout 下 stop/EOL 决策本身不稳；
+4. 与 baseline mixed r=5 的 4/4 answer-ish、3/4 EOL 相比，condition-only query anchor 仍然没有超过原版 CoLaR。
+```
+
+#### B3. query-anchor EOL 失败诊断与 condition input norm 修复
+
+2026-06-09 对 query-anchor 的 EOL 掉点做了 teacher-forcing 诊断。结论不是 prompt/EOL label bug：
+
+```text
+old condition-only prompt_last checkpoint:
+  gold path teacher forcing 下 4 个样本的 gold </think> rank 都是 1
+  prefix/audio merge 也能对齐
+```
+
+真正可疑点是 condition head 的输入尺度。旧实现直接拼：
+
+```text
+[h, q, h * q]
+```
+
+诊断发现 `h` / `q` RMS 约 2-4，但 `h*q` RMS 可到 24-90，interaction 项尺度过大，容易主导 condition head。对应训练上旧 condition-only 的 `embed_loss ~= 0.0500`，明显差于 baseline mixed r=5 的 `embed_loss ~= 0.00618`。
+
+因此新增配置：
+
+```text
+QUERY_ANCHOR_CONDITION_INTERACTION=1/0
+QUERY_ANCHOR_CONDITION_INPUT_NORM=1/0
+```
+
+实现要点：
+
+```text
+condition_input_norm=1 时：
+  使用 layer_norm(h), layer_norm(q)
+  如果保留 interaction，则使用 layer_norm(layer_norm(h) * layer_norm(q))
+
+condition_interaction=0 时：
+  condition head 输入只拼 [h, q]
+```
+
+相关文件：
+
+```text
+diagnose_query_anchor_teacher_forcing.py
+colar_plugin/query_anchor_policy.py
+colar_plugin/query_anchor_trainer.py
+colar_plugin/query_anchor_infer.py
+overfit_check_query_anchor_audio_r5.sh
+overfit_check_query_anchor_audio_r10.sh
+```
+
+已验证：
+
+```text
+python -m py_compile ... 通过
+bash -n overfit/infer query-anchor 脚本通过
+旧 checkpoint 兼容加载通过
+```
+
+#### B4. condition norm 五组 r=5 复测
+
+五个 condition-norm r=5 实验均训练到 checkpoint-300，并用相同推理设置复测：
+
+```text
+LIMIT=4
+MAX_LATENT_FORWARD=400
+MAX_NEW_TOKENS=512
+LATENT_TEMPERATURE=1.0
+EOL_TEMPERATURE=1.0
+```
+
+实验列表：
+
+```text
+1. output/qwen3omni_query_anchor_condnorm_promptlast_r5_mse_sqrt
+   condition_interaction=true,  condition_input_norm=true, residual=false, hidden_source=prompt_last
+
+2. output/qwen3omni_query_anchor_condnorm_nointer_promptlast_r5_mse_sqrt
+   condition_interaction=false, condition_input_norm=true, residual=false, hidden_source=prompt_last
+
+3. output/qwen3omni_query_anchor_condnorm_userlast_r5_mse_sqrt
+   condition_interaction=true,  condition_input_norm=true, residual=false, hidden_source=user_last
+
+4. output/qwen3omni_query_anchor_condnorm_nointer_userlast_r5_mse_sqrt
+   condition_interaction=false, condition_input_norm=true, residual=false, hidden_source=user_last
+
+5. output/qwen3omni_query_anchor_condnorm_promptlast_noise005_r5_mse_sqrt
+   condition_interaction=true,  condition_input_norm=true, residual=false, hidden_source=prompt_last, noise_std=0.05
+```
+
+五组推理结果完全一致：
+
+```text
+answer-ish: 4/4
+eol hits:   3/4
+latent steps: [94, 400, 121, 104]
+
+idx 0: audio, n_latent_forward=94,  hit_eol=True
+idx 1: audio, n_latent_forward=400, hit_eol=False
+idx 2: text,  n_latent_forward=121, hit_eol=True
+idx 3: audio, n_latent_forward=104, hit_eol=True
+```
+
+对比：
+
+```text
+baseline mixed r=5:
+  answer-ish 4/4, eol 3/4, steps [94, 400, 121, 104]
+
+old condition-only prompt_last:
+  sampled: answer-ish 3/4, eol 2/4, steps [94, 400, 121, 400]
+  greedy:  answer-ish 4/4, eol 2/4, steps [94, 400, 121, 400]
+```
+
+训练末尾 loss：
+
+```text
+baseline mixed r=5:
+  ce_loss ~= 0.3054, embed_loss ~= 0.00618
+
+old condition-only prompt_last:
+  ce_loss ~= 0.3444, embed_loss ~= 0.0500
+
+new condnorm r=5:
+  condnorm_promptlast:              ce_loss ~= 0.3065, embed_loss ~= 0.0181
+  condnorm_nointer_promptlast:      ce_loss ~= 0.3058, embed_loss ~= 0.0168
+  condnorm_userlast:                ce_loss ~= 0.3066, embed_loss ~= 0.0280
+  condnorm_nointer_userlast:        ce_loss ~= 0.3060, embed_loss ~= 0.0232
+  condnorm_promptlast_noise005:     ce_loss ~= 0.3044, embed_loss ~= 0.0173
+```
+
+结论：
+
+```text
+1. condition_input_norm 修掉了旧 query-anchor 在 idx 3 上的 EOL 退化；
+2. query-anchor condition-only 不再拖 baseline r=5 后腿；
+3. 但 condition-only r=5 也没有超过 baseline，idx 1 仍是 baseline 自身也失败的 400-step EOL miss；
+4. no-inter + prompt_last 的 embed_loss 最低，后续默认优先使用：
+   QUERY_ANCHOR_CONDITION_INTERACTION=0
+   QUERY_ANCHOR_CONDITION_INPUT_NORM=1
+   QUERY_ANCHOR_RESIDUAL=0
+   QUERY_ANCHOR_HIDDEN_SOURCE=prompt_last
+```
+
+#### B5. 新五组：r10/nores 与 residual anchor 对照
+
+随后又跑了五组新实验，并用五张卡并行推理。
+
+推理设置：
+
+```text
+LIMIT=4
+MAX_LATENT_FORWARD=400
+MAX_NEW_TOKENS=512
+LATENT_TEMPERATURE=1.0
+EOL_TEMPERATURE=1.0
+```
+
+实验与结果：
+
+```text
+r10_nores:
+  dir: output/qwen3omni_query_anchor_condnorm_nointer_promptlast_r10_mse_sqrt
+  checkpoint: overfit_ckpt_audio_r10/v0-20260609-134706/checkpoint-300
+  config: r=10, condition_input_norm=true, condition_interaction=false, residual=false
+  answer-ish: 4/4
+  eol hits:   4/4
+  steps: [47, 178, 61, 52]
+
+r5_res_hidden:
+  dir: output/qwen3omni_query_anchor_condnorm_nointer_promptlast_residual_r5_mse_sqrt
+  checkpoint: overfit_ckpt_audio_r5/v0-20260609-134733/checkpoint-300
+  config: r=5, residual=true, residual_source=hidden, gate_init=0.1
+  answer-ish: 3/4
+  eol hits:   3/4
+  steps: [94, 400, 121, 154]
+
+r10_res_hidden:
+  dir: output/qwen3omni_query_anchor_condnorm_nointer_promptlast_residual_r10_mse_sqrt
+  checkpoint: overfit_ckpt_audio_r10/v0-20260609-134908/checkpoint-300
+  config: r=10, residual=true, residual_source=hidden, gate_init=0.1
+  answer-ish: 3/4
+  eol hits:   2/4
+  steps: [47, 400, 61, 400]
+
+r5_res_embed:
+  dir: output/qwen3omni_query_anchor_condnorm_nointer_promptlast_residual_embed_r5_mse_sqrt
+  checkpoint: overfit_ckpt_audio_r5/v0-20260609-134921/checkpoint-300
+  config: r=5, residual=true, residual_source=embed, gate_init=0.1
+  answer-ish: 4/4
+  eol hits:   3/4
+  steps: [94, 400, 121, 104]
+
+r5_res_hidden_g003:
+  dir: output/qwen3omni_query_anchor_condnorm_nointer_promptlast_residual_g003_r5_mse_sqrt
+  checkpoint: overfit_ckpt_audio_r5/v0-20260609-134930/checkpoint-300
+  config: r=5, residual=true, residual_source=hidden, gate_init=0.03
+  answer-ish: 4/4
+  eol hits:   1/4
+  steps: [94, 400, 400, 400]
+```
+
+baseline 对照：
+
+```text
+baseline mixed r=10:
+  answer-ish 4/4, eol 4/4, steps [47, 178, 61, 52]
+
+baseline mixed r=5:
+  answer-ish 4/4, eol 3/4, steps [94, 400, 121, 104]
+```
+
+训练末尾 loss：
+
+```text
+r10_nores:
+  ce_loss ~= 0.2438, embed_loss ~= 0.00718
+
+r5_res_hidden:
+  ce_loss ~= 0.3352, embed_loss ~= 0.05844
+
+r10_res_hidden:
+  ce_loss ~= 0.2842, embed_loss ~= 0.04013
+
+r5_res_embed:
+  ce_loss ~= 0.3062, embed_loss ~= 0.01681
+
+r5_res_hidden_g003:
+  ce_loss ~= 0.3297, embed_loss ~= 0.06205
+```
+
+结论：
+
+```text
+1. r10_nores 完全追平 baseline r=10，说明 condition-only + input_norm + no-inter 是安全主线；
+2. hidden residual 是明显负向：
+   - r10 baseline/nores 能 4/4 EOL，但 r10_res_hidden 只有 2/4 EOL；
+   - r5_res_hidden 在 idx 1 上 answer 也掉到 False；
+   - hidden residual 的 embed_loss 明显升高到 0.04-0.06；
+3. embed residual 没明显伤害，但也没有收益，基本复刻 baseline r=5；
+4. 小 gate=0.03 并未解决 hidden residual 问题，反而 EOL 更差；
+5. 当前主线应收敛到 condition-only，不建议继续直接走 hidden residual anchor。
+```
+
+#### B6. residual anchor gate 训练后数值
+
+直接读取 checkpoint-300 的 `latent_policy.pt` 中 `anchor_gate`，确认 gate 是可训练且有更新的。注意：当前 `colar_config.json` 没保存 `query_anchor_gate_init`，只保存了 `query_anchor_gate_l2`；真实 gate 值需从 `latent_policy.pt` 读取。
+
+checkpoint-300 结果：
+
+```text
+r5_res_hidden_g010:
+  init=0.10
+  checkpoint-300 anchor_gate=0.108856268
+  delta=+0.008856
+
+r10_res_hidden_g010:
+  init=0.10
+  checkpoint-300 anchor_gate=0.108835079
+  delta=+0.008835
+
+r5_res_embed_g010:
+  init=0.10
+  checkpoint-300 anchor_gate=0.083219431
+  delta=-0.016781
+
+r5_res_hidden_g003:
+  init=0.03
+  checkpoint-300 anchor_gate=0.047263760
+  delta=+0.017264
+```
+
+gate 曲线：
+
+```text
+r5_res_hidden_g010:
+  ckpt-50  0.108497441
+  ckpt-100 0.109239988
+  ckpt-150 0.109544449
+  ckpt-200 0.108642094
+  ckpt-250 0.109050550
+  ckpt-300 0.108856268
+
+r10_res_hidden_g010:
+  ckpt-50  0.107159667
+  ckpt-100 0.107834123
+  ckpt-150 0.108418323
+  ckpt-200 0.108574271
+  ckpt-250 0.108885556
+  ckpt-300 0.108835079
+
+r5_res_embed_g010:
+  ckpt-50  0.091047741
+  ckpt-100 0.086415298
+  ckpt-150 0.085062288
+  ckpt-200 0.084085286
+  ckpt-250 0.083329201
+  ckpt-300 0.083219431
+
+r5_res_hidden_g003:
+  ckpt-50  0.040755257
+  ckpt-100 0.043727878
+  ckpt-150 0.046002377
+  ckpt-200 0.046821374
+  ckpt-250 0.047472868
+  ckpt-300 0.047263760
+```
+
+gate 观察：
+
+```text
+1. hidden residual 的 gate 会被训练往上推：
+   0.10 -> ~0.109；0.03 -> ~0.047
+2. 但 hidden residual 推理表现更差，说明优化正在增强一个对 free rollout 有害的方向；
+3. embed residual 的 gate 会被训练往下压：
+   0.10 -> ~0.083
+4. 小 gate 仍然被推大且 EOL 更差，所以问题不是简单的 gate 初始值过大，而是 hidden residual 方向/空间对齐本身有问题。
+```
+
+后续记录改进建议：
+
+```text
+把 query_anchor_gate_init 写入 colar_config.json，避免之后只能从 latent_policy.pt 反查。
+```
+
+#### B7. r=5 EOL miss 的训练侧消融
+
+在确认 residual anchor 不值得继续走后，围绕 `condition-only + input_norm + no-inter + no residual` 继续做 r=5 训练侧消融，目标是修复 mixed r=5 中 `idx=1` 的 `400-step EOL miss`。
+
+共同配置：
+
+```text
+QUERY_ANCHOR_CONDITION_HEAD=1
+QUERY_ANCHOR_CONDITION_INTERACTION=0
+QUERY_ANCHOR_CONDITION_INPUT_NORM=1
+QUERY_ANCHOR_RESIDUAL=0
+QUERY_ANCHOR_HIDDEN_SOURCE=prompt_last
+COLAR_EMBED_LOSS=mse
+COLAR_SQRT_MEAN=1
+```
+
+五组实验：
+
+```text
+r5_s600:
+  dir: output/qwen3omni_query_anchor_condnorm_nointer_promptlast_r5_s600_mse_sqrt
+  checkpoint: overfit_ckpt_audio_r5/v0-20260609-163320/checkpoint-600
+  change: MAX_STEPS=600
+
+r5_embedw2:
+  dir: output/qwen3omni_query_anchor_condnorm_nointer_promptlast_r5_embedw2_mse_sqrt
+  checkpoint: overfit_ckpt_audio_r5/v0-20260609-163334/checkpoint-300
+  change: COLAR_EMBED_WEIGHT=2.0
+
+r5_embedw4:
+  dir: output/qwen3omni_query_anchor_condnorm_nointer_promptlast_r5_embedw4_mse_sqrt
+  checkpoint: overfit_ckpt_audio_r5/v0-20260609-163343/checkpoint-300
+  change: COLAR_EMBED_WEIGHT=4.0
+
+r5_noise005:
+  dir: output/qwen3omni_query_anchor_condnorm_nointer_promptlast_r5_noise005_mse_sqrt
+  checkpoint: overfit_ckpt_audio_r5/v0-20260609-163350/checkpoint-300
+  change: QUERY_ANCHOR_NOISE_STD=0.05
+
+r5_deterministic:
+  dir: output/qwen3omni_query_anchor_condnorm_nointer_promptlast_r5_deterministic_mse_sqrt
+  checkpoint: overfit_ckpt_audio_r5/v0-20260609-163358/checkpoint-300
+  change: COLAR_DETERMINISTIC=1
+```
+
+推理设置：
+
+```text
+LIMIT=4
+MAX_LATENT_FORWARD=400
+MAX_NEW_TOKENS=512
+LATENT_TEMPERATURE=1.0
+EOL_TEMPERATURE=1.0
+```
+
+推理结果：
+
+```text
+r5_s600:
+  answer-ish: 4/4
+  eol hits:   4/4
+  steps: [94, 356, 121, 104]
+
+r5_embedw2:
+  answer-ish: 4/4
+  eol hits:   4/4
+  steps: [94, 356, 121, 104]
+
+r5_embedw4:
+  answer-ish: 4/4
+  eol hits:   4/4
+  steps: [94, 356, 121, 104]
+
+r5_noise005:
+  answer-ish: 4/4
+  eol hits:   3/4
+  steps: [94, 400, 121, 104]
+
+r5_deterministic:
+  answer-ish: 4/4
+  eol hits:   3/4
+  steps: [94, 400, 121, 104]
+```
+
+baseline / previous 对照：
+
+```text
+baseline mixed r=5:
+  answer-ish 4/4, eol 3/4, steps [94, 400, 121, 104]
+
+previous condnorm nores r=5:
+  answer-ish 4/4, eol 3/4, steps [94, 400, 121, 104]
+
+baseline mixed r=10:
+  answer-ish 4/4, eol 4/4, steps [47, 178, 61, 52]
+```
+
+训练末尾 loss：
+
+```text
+r5_s600:
+  ce_loss ~= 0.3011, embed_loss ~= 0.000817
+
+r5_embedw2:
+  ce_loss ~= 0.3046, embed_loss ~= 0.007464
+
+r5_embedw4:
+  ce_loss ~= 0.3074, embed_loss ~= 0.003672
+
+r5_noise005:
+  ce_loss ~= 0.3041, embed_loss ~= 0.016016
+
+r5_deterministic:
+  ce_loss ~= 0.3050, embed_loss ~= 0.010648
+```
+
+结论：
+
+```text
+1. r=5 的 idx=1 EOL miss 可以通过更强 latent 对齐修掉，不需要 residual anchor；
+2. MAX_STEPS=600 最稳，embed_loss 压到 0.000817，并得到 4/4 EOL；
+3. 从训练成本看，COLAR_EMBED_WEIGHT=2.0 更划算：300 step 就得到 4/4 EOL；
+4. COLAR_EMBED_WEIGHT=4.0 也能 4/4 EOL，但 ce_loss 稍高，没有明显优先级；
+5. QUERY_ANCHOR_NOISE_STD=0.05 和 COLAR_DETERMINISTIC=1 没修掉 idx=1 EOL miss，暂时不作为主线。
+```
+
+后续推荐主线：
+
+```text
+QUERY_ANCHOR_CONDITION_HEAD=1
+QUERY_ANCHOR_CONDITION_INTERACTION=0
+QUERY_ANCHOR_CONDITION_INPUT_NORM=1
+QUERY_ANCHOR_RESIDUAL=0
+QUERY_ANCHOR_HIDDEN_SOURCE=prompt_last
+COLAR_EMBED_WEIGHT=2.0
+```
