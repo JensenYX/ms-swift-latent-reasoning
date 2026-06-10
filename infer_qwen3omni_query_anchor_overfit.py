@@ -45,6 +45,7 @@ def build_query_anchor_generator(args, checkpoint: Path, ckpt_args, plugin: Path
         "max_new_tokens": args.max_new_tokens,
         "answer_temperature": args.temperature,
         "progress_every": args.progress_every,
+        "latent_rms_target": args.latent_rms_target,
     }
 
     print(f"[infer:query-anchor] model: {model}")
@@ -56,7 +57,7 @@ def build_query_anchor_generator(args, checkpoint: Path, ckpt_args, plugin: Path
     print(
         f"[infer:query-anchor] max_latent_forward={args.max_latent_forward} "
         f"latent_temperature={args.latent_temperature} eol_temperature={args.eol_temperature} "
-        f"max_new_tokens={args.max_new_tokens}"
+        f"max_new_tokens={args.max_new_tokens} latent_rms_target={args.latent_rms_target}"
     )
 
     return build_query_anchor_latent_generator(
@@ -180,6 +181,9 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=8192)
     parser.add_argument("--max-latent-forward", type=int, default=2048)
     parser.add_argument("--latent-temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--latent-rms-target", type=float, default=0.0,
+        help=">0: renormalize each rollout latent to this RMS (normalized space) before anchoring/feeding back. 0=off.")
     parser.add_argument("--eol-temperature", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--progress-every", type=int, default=0)

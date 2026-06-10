@@ -32,13 +32,24 @@ CoLaR 专属超参通过环境变量传入（ms-swift 的 argument dataclass 不
   COLAR_LP_INTERMEDIATE  latent head 中间维度，默认 = hidden_size
   COLAR_DETERMINISTIC    '1' 则 latent head 退化为确定性（std≈0），默认 '0'
   COLAR_SQRT_MEAN        '1' 则压缩归一化用 sqrt(count)，默认 '0'
+  COLAR_SS_PROB          scheduled sampling 概率，默认 0.0（关闭）。>0 时缓存上一轮
+                         同一样本的 latent head 自身预测，再以该概率把 latent 输入
+                         位置的 gold compressed embedding 替换为模型预测的
+                         detached embedding，监督目标保持 clean gold 不变。这样不
+                         需要额外 text-model forward，可与 gradient checkpointing
+                         共存。
+  COLAR_SS_TEMPERATURE   scheduled sampling 预测采样温度，默认 1.0（与推理一致）
+  COLAR_SS_WARMUP_STEPS  >0 时 ss_prob 在前 N 个 global step 内从 0 线性升到
+                         COLAR_SS_PROB，避免训练初期被纯噪声预测污染；默认 0
+  COLAR_SS_CACHE_MAX     scheduled sampling 预测缓存容量，默认 128
 """
 import json
 import os
 import random
+from collections import OrderedDict
 from functools import wraps
 from types import MethodType
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -84,6 +95,11 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
         self.colar_embed_loss = os.environ.get('COLAR_EMBED_LOSS', 'nll').lower()
         self.colar_sqrt_mean = _env_bool('COLAR_SQRT_MEAN', False)
         self.colar_deterministic = _env_bool('COLAR_DETERMINISTIC', False)
+        self.colar_ss_prob = _env_float('COLAR_SS_PROB', 0.0)
+        self.colar_ss_temperature = _env_float('COLAR_SS_TEMPERATURE', 1.0)
+        self.colar_ss_warmup_steps = _env_int('COLAR_SS_WARMUP_STEPS', 0)
+        self.colar_ss_cache_max = _env_int('COLAR_SS_CACHE_MAX', 128)
+        self._colar_ss_cache: "OrderedDict[Tuple[int, Tuple[int, ...]], torch.Tensor]" = OrderedDict()
 
         self.think_open_id = THINK_OPEN_ID
         self.think_close_id = THINK_CLOSE_ID
@@ -125,7 +141,9 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
                     f'ce_w={self.colar_ce_weight} '
                     f'embed_w={self.colar_embed_weight} embed_loss={self.colar_embed_loss} '
                     f'deterministic={self.colar_deterministic} embeds_std={self.embeds_std:.5f} '
-                    f'hidden={hidden_size} lp_inter={self.colar_lp_intermediate}')
+                    f'hidden={hidden_size} lp_inter={self.colar_lp_intermediate} '
+                    f'ss_prob={self.colar_ss_prob} ss_temp={self.colar_ss_temperature} '
+                    f'ss_warmup={self.colar_ss_warmup_steps} ss_cache_max={self.colar_ss_cache_max}')
 
     # ---- 确保 latent head 进入优化器 ----
     def create_optimizer(self, *args, **kwargs):
@@ -157,6 +175,10 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
                     'entropy_weight': self.colar_entropy_weight,
                     'embed_loss': self.colar_embed_loss,
                     'sqrt_mean': self.colar_sqrt_mean,
+                    'ss_prob': self.colar_ss_prob,
+                    'ss_temperature': self.colar_ss_temperature,
+                    'ss_warmup_steps': self.colar_ss_warmup_steps,
+                    'ss_cache_max': self.colar_ss_cache_max,
                     'think_open_id': self.think_open_id,
                     'think_close_id': self.think_close_id,
                 }
@@ -248,6 +270,19 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
             embeds, attn, new_labels, think_mask, gold_source = self._compress_batch(
                 input_ids, base_embeds, labels, attention_mask, r)
 
+        # 3.5) cached scheduled sampling：以一定概率把 latent 输入位置的
+        #      gold compressed embedding 换成同一样本上一轮的模型预测
+        #     （detached），监督目标不变。避免额外 text-model forward。
+        if r > 1 and self.colar_ss_prob > 0 and self.model.training:
+            latent_input_mask = self._latent_input_mask_from_think_mask(think_mask)
+            embeds = self._apply_cached_scheduled_sampling(
+                input_ids=input_ids,
+                raw_attention_mask=attention_mask,
+                r=r,
+                embeds=embeds,
+                latent_input_mask=latent_input_mask,
+            )
+
         # 4) position_ids：cumsum(mask)-1（mrope 退化，传 2D，文本主干自动扩成 4 行）
         position_ids = torch.clamp_min(attn.long().cumsum(dim=1) - 1, 0)
 
@@ -269,7 +304,20 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
         ce_loss = self._causal_ce(logits, new_labels)
 
         # 7) latent head loss（在思考段上预测“下一个 embedding”）
-        embed_loss, entropy = self._latent_loss(hidden, gold_source, think_mask)
+        update_ss_cache = r > 1 and self.colar_ss_prob > 0 and self.model.training
+        if update_ss_cache:
+            embed_loss, entropy, ss_pred_norm = self._latent_loss(
+                hidden, gold_source, think_mask, return_cache_pred=True)
+            self._store_scheduled_sampling_cache(
+                input_ids=input_ids,
+                raw_attention_mask=attention_mask,
+                compressed_attention_mask=attn,
+                r=r,
+                pred_normalized=ss_pred_norm,
+            )
+            del ss_pred_norm
+        else:
+            embed_loss, entropy = self._latent_loss(hidden, gold_source, think_mask)
 
         # device_map 下 ce_loss / embed_loss 可能在不同卡，统一搬到 ce_loss 设备再相加
         loss_dev = ce_loss.device
@@ -302,6 +350,129 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
         if return_outputs:
             return outputs['loss'], outputs
         return outputs['loss']   # HF Trainer 要求 loss 回到原始输入设备（cuda:0）
+
+    # ---------- scheduled sampling ----------
+    def _ss_effective_prob(self) -> float:
+        p = self.colar_ss_prob
+        if self.colar_ss_warmup_steps > 0:
+            step = int(getattr(self.state, 'global_step', 0) or 0)
+            p = p * min(1.0, step / float(self.colar_ss_warmup_steps))
+        return p
+
+    def _latent_input_mask_from_think_mask(self, think_mask: torch.Tensor) -> torch.Tensor:
+        """think_mask 的第一个位置是 prefix 最后一个 token（它的输入不是 latent），
+        其余位置的输入才是 compressed latent embedding，可被 scheduled sampling 替换。"""
+        mask = torch.zeros_like(think_mask)
+        for b in range(think_mask.shape[0]):
+            idx = torch.nonzero(think_mask[b] > 0, as_tuple=False).flatten()
+            if idx.numel() > 1:
+                mask[b, idx[1:]] = 1.0
+        return mask
+
+    def _ss_cache_key(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        batch_idx: int,
+        r: int,
+    ) -> Tuple[int, Tuple[int, ...]]:
+        valid_len = int(attention_mask[batch_idx].sum().item())
+        row = input_ids[batch_idx, :valid_len].detach().cpu().tolist()
+        return int(r), tuple(int(x) for x in row)
+
+    def _apply_cached_scheduled_sampling(
+        self,
+        input_ids: torch.Tensor,
+        raw_attention_mask: torch.Tensor,
+        r: int,
+        embeds: torch.Tensor,
+        latent_input_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replace latent inputs with cached detached predictions from prior visits.
+
+        This is a memory-bounded scheduled-sampling approximation for the
+        current overfit regime.  A true same-step implementation needs an
+        additional text-model forward before the real forward, which OOMs on
+        the 30B Qwen3-Omni setup.  The cache keeps the behavioral surface close
+        to inference while preserving the single-backbone-forward training path.
+        """
+        p = self._ss_effective_prob()
+        if p <= 0 or self.colar_ss_cache_max <= 0 or not self._colar_ss_cache:
+            return embeds
+        if latent_input_mask.sum().item() <= 0:
+            return embeds
+
+        cached = torch.zeros_like(embeds)
+        available = torch.zeros_like(latent_input_mask)
+        for b in range(embeds.shape[0]):
+            key = self._ss_cache_key(input_ids, raw_attention_mask, b, r)
+            pred = self._colar_ss_cache.get(key)
+            if pred is None:
+                continue
+            self._colar_ss_cache.move_to_end(key)
+            if pred.shape[-1] != embeds.shape[-1]:
+                continue
+            n = min(int(pred.shape[0]), int(embeds.shape[1]))
+            cached[b, :n] = pred[:n].to(device=embeds.device, dtype=embeds.dtype)
+            available[b, :n] = 1.0
+
+        replaceable = latent_input_mask * available
+        if replaceable.sum().item() <= 0:
+            return embeds
+        replace = (torch.rand_like(latent_input_mask) < p).to(embeds.dtype) * replaceable.to(embeds.dtype)
+        replace = replace.unsqueeze(-1)
+        return embeds * (1.0 - replace) + cached * replace
+
+    def _scheduled_sampling_dist(
+        self,
+        hidden: torch.Tensor,
+        temperature: float,
+        query_hidden: Optional[torch.Tensor] = None,
+    ):
+        del query_hidden
+        return self.latent_policy(hidden, temperature=temperature)
+
+    def _scheduled_sampling_pred_to_embeds(
+        self,
+        pred_next_normalized: torch.Tensor,
+        query_hidden: Optional[torch.Tensor] = None,
+        residual_query: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del query_hidden, residual_query
+        return pred_next_normalized * float(self.embeds_std)
+
+    @torch.no_grad()
+    def _store_scheduled_sampling_cache(
+        self,
+        input_ids: torch.Tensor,
+        raw_attention_mask: torch.Tensor,
+        compressed_attention_mask: torch.Tensor,
+        r: int,
+        pred_normalized: torch.Tensor,
+        query_hidden: Optional[torch.Tensor] = None,
+        residual_query: Optional[torch.Tensor] = None,
+    ) -> None:
+        if self.colar_ss_cache_max <= 0:
+            return
+
+        # hidden[t] 的预测对应位置 t+1 的输入，右移后即可按输入位置索引替换。
+        pred_next_norm = torch.roll(pred_normalized.detach(), shifts=1, dims=1)
+        q = query_hidden.detach() if query_hidden is not None else None
+        rq = residual_query.detach() if residual_query is not None else None
+        pred_next = self._scheduled_sampling_pred_to_embeds(
+            pred_next_norm,
+            query_hidden=q,
+            residual_query=rq,
+        )
+        pred_next = pred_next.detach().cpu().to(dtype=torch.float16)
+
+        for b in range(pred_next.shape[0]):
+            key = self._ss_cache_key(input_ids, raw_attention_mask, b, r)
+            comp_len = int(compressed_attention_mask[b].sum().item())
+            self._colar_ss_cache[key] = pred_next[b, :comp_len].clone()
+            self._colar_ss_cache.move_to_end(key)
+            while len(self._colar_ss_cache) > self.colar_ss_cache_max:
+                self._colar_ss_cache.popitem(last=False)
 
     # ---------- 工具 ----------
     def _build_base_embeds(
@@ -347,7 +518,7 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
         return loss
 
     def _latent_loss(self, hidden: torch.Tensor, gold_source: torch.Tensor,
-                     think_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                     think_mask: torch.Tensor, return_cache_pred: bool = False):
         """
         在思考段位置 t：hidden[t] 预测 embed[t+1]。
         dist = latent_policy(hidden[t])，gold = gold_source[t+1] / embeds_std。
@@ -366,12 +537,15 @@ class ColarSeq2SeqTrainer(Seq2SeqTrainer):
             pred = dist.rsample()
             per = F.mse_loss(pred, gold.detach(), reduction='none').mean(dim=-1)   # [B, L']
         else:  # nll
+            pred = dist.mean
             per = -dist.log_prob(gold.detach()).mean(dim=-1)                       # [B, L']
 
         denom = think_mask.sum().clamp_min(1.0)
         embed_loss = (per * think_mask).sum() / denom
         ent = dist.entropy().mean(dim=-1)
         entropy = (ent * think_mask).sum() / denom
+        if return_cache_pred:
+            return embed_loss, entropy, pred.detach()
         return embed_loss, entropy
 
     def _compress_batch(self, input_ids, base_embeds, labels, attention_mask, r):

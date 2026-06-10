@@ -232,6 +232,7 @@ def build_latent_generator(args, checkpoint: Path, ckpt_args: Dict[str, Any], pl
         "max_new_tokens": args.max_new_tokens,
         "answer_temperature": args.temperature,
         "progress_every": args.progress_every,
+        "latent_rms_target": args.latent_rms_target,
     }
 
     print(f"[infer:latent] model: {model}")
@@ -243,7 +244,7 @@ def build_latent_generator(args, checkpoint: Path, ckpt_args: Dict[str, Any], pl
     print(
         f"[infer:latent] max_latent_forward={args.max_latent_forward} "
         f"latent_temperature={args.latent_temperature} eol_temperature={args.eol_temperature} "
-        f"max_new_tokens={args.max_new_tokens}"
+        f"max_new_tokens={args.max_new_tokens} latent_rms_target={args.latent_rms_target}"
     )
 
     return build_colar_latent_generator(
@@ -452,6 +453,9 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=8192)
     parser.add_argument("--max-latent-forward", type=int, default=2048, help="Max latent reasoning steps.")
     parser.add_argument("--latent-temperature", type=float, default=0.0, help="LatentPolicy sampling temperature.")
+    parser.add_argument(
+        "--latent-rms-target", type=float, default=0.0,
+        help=">0: renormalize each rollout latent to this RMS (normalized space) before feeding back. 0=off.")
     parser.add_argument("--eol-temperature", type=float, default=0.0, help="Temperature for </think> EOL check.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Answer generation temperature.")
     parser.add_argument("--progress-every", type=int, default=0, help="Print answer decode progress every N tokens.")

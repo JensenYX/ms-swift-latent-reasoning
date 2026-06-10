@@ -44,6 +44,10 @@ fi
 : "${COLAR_EMBED_LOSS:=mse}"
 : "${COLAR_DETERMINISTIC:=0}"
 : "${COLAR_SQRT_MEAN:=1}"
+: "${COLAR_SS_PROB:=0.0}"
+: "${COLAR_SS_TEMPERATURE:=1.0}"
+: "${COLAR_SS_WARMUP_STEPS:=0}"
+: "${COLAR_SS_CACHE_MAX:=128}"
 export COLAR_MAX_R
 export COLAR_FIXED_R
 export COLAR_CE_WEIGHT
@@ -52,15 +56,26 @@ export COLAR_ENTROPY_WEIGHT
 export COLAR_EMBED_LOSS
 export COLAR_DETERMINISTIC
 export COLAR_SQRT_MEAN
+export COLAR_SS_PROB
+export COLAR_SS_TEMPERATURE
+export COLAR_SS_WARMUP_STEPS
+export COLAR_SS_CACHE_MAX
 
 : "${CUDA_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"
 : "${NUMBA_CACHE_DIR:=/tmp/numba_cache_colar}"
+# 训练显存贴近 80GB 上限；expandable_segments 可缓解 reserved-but-unallocated
+# 碎片导致的小额分配 OOM。
+: "${PYTORCH_ALLOC_CONF:=expandable_segments:True}"
+: "${PYTORCH_CUDA_ALLOC_CONF:=${PYTORCH_ALLOC_CONF}}"
+export PYTORCH_ALLOC_CONF
+export PYTORCH_CUDA_ALLOC_CONF
 : "${NPROC_PER_NODE:=4}"
 : "${SAVE_STEPS:=50}"
 : "${SAVE_TOTAL_LIMIT:=6}"
 : "${SAVE_ONLY_MODEL:=true}"
 : "${WARMUP_RATIO:=0.05}"
 : "${MAX_STEPS:=300}"
+: "${GRADIENT_CHECKPOINTING:=true}"
 export CUDA_VISIBLE_DEVICES
 export NUMBA_CACHE_DIR
 
@@ -90,6 +105,7 @@ fi
 echo ">>> scheduler: cosine, warmup_ratio=${WARMUP_RATIO}"
 echo ">>> train: max_steps=${MAX_STEPS}"
 echo ">>> colar: fixed_r=${COLAR_FIXED_R}, embed_loss=${COLAR_EMBED_LOSS}, sqrt_mean=${COLAR_SQRT_MEAN}, deterministic=${COLAR_DETERMINISTIC}"
+echo ">>> colar: ss_prob=${COLAR_SS_PROB}, ss_temperature=${COLAR_SS_TEMPERATURE}, ss_warmup_steps=${COLAR_SS_WARMUP_STEPS}, ss_cache_max=${COLAR_SS_CACHE_MAX}"
 echo ">>> overfit_limit=${OVERFIT_LIMIT}"
 echo ">>> dataset: ${DATASET_PATH}"
 echo ">>> output_dir: ${OUTPUT_DIR}/overfit_ckpt_audio_r10"
@@ -127,7 +143,7 @@ swift sft \
     --lr_scheduler_type            cosine \
     --warmup_ratio                 "${WARMUP_RATIO}" \
     --weight_decay                 0.0 \
-    --gradient_checkpointing       true \
+    --gradient_checkpointing       "${GRADIENT_CHECKPOINTING}" \
     --padding_free                 false \
     --ddp_find_unused_parameters   "${DDP_FIND_UNUSED_PARAMETERS}" \
     \

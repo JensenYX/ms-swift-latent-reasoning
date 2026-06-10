@@ -43,6 +43,7 @@ class QueryAnchorInferConfig:
     max_new_tokens: int = 8192
     answer_temperature: float = 0.0
     progress_every: int = 0
+    latent_rms_target: float = 0.0
 
 
 def load_query_anchor_infer_config(
@@ -79,6 +80,7 @@ def load_query_anchor_infer_config(
         max_new_tokens=int(overrides.get('max_new_tokens', 8192)),
         answer_temperature=float(overrides.get('answer_temperature', 0.0)),
         progress_every=int(overrides.get('progress_every', 0)),
+        latent_rms_target=float(overrides.get('latent_rms_target', 0.0)),
     )
 
 
@@ -241,6 +243,9 @@ class QueryAnchoredColarLatentGenerator:
             else:
                 dist = self.latent_policy(lp_hidden, query_hidden=lp_query, temperature=cfg.latent_temperature)
                 sampled = dist.rsample()
+            if cfg.latent_rms_target > 0:
+                rms = sampled.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-6)
+                sampled = sampled * (cfg.latent_rms_target / rms).to(sampled.dtype)
 
             lp_residual_query = residual_query.to(device=self.lp_device, dtype=torch.float32)
             anchored = self.latent_policy.apply_anchor_normalized(sampled, lp_residual_query)

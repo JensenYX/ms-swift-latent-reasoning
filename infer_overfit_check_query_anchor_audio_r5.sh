@@ -25,6 +25,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${PROGRESS_EVERY:=128}"
 : "${LATENT_TEMPERATURE:=1.0}"
 : "${EOL_TEMPERATURE:=1.0}"
+: "${LATENT_RMS_TARGET:=0}"
 
 export CUDA_VISIBLE_DEVICES
 export NUMBA_CACHE_DIR
@@ -36,6 +37,7 @@ echo ">>> output=${OUTPUT}"
 echo ">>> max_latent_forward=${MAX_LATENT_FORWARD}"
 echo ">>> latent_temperature=${LATENT_TEMPERATURE}"
 echo ">>> eol_temperature=${EOL_TEMPERATURE}"
+echo ">>> latent_rms_target=${LATENT_RMS_TARGET}"
 
 CMD=(
     python "${SCRIPT_DIR}/infer_qwen3omni_query_anchor_overfit.py"
@@ -51,6 +53,7 @@ CMD=(
     --attn-impl "${ATTN_IMPL}"
     --progress-every "${PROGRESS_EVERY}"
     --latent-temperature "${LATENT_TEMPERATURE}"
+    --latent-rms-target "${LATENT_RMS_TARGET}"
     --eol-temperature "${EOL_TEMPERATURE}"
 )
 

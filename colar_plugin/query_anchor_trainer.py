@@ -189,6 +189,14 @@ class QueryAnchoredColarSeq2SeqTrainer(ColarSeq2SeqTrainer):
                 latent_input_mask=latent_input_mask,
                 embeds_std=self.embeds_std,
             )
+            if self.colar_ss_prob > 0 and self.model.training:
+                embeds = self._apply_cached_scheduled_sampling(
+                    input_ids=input_ids,
+                    raw_attention_mask=attention_mask,
+                    r=r,
+                    embeds=embeds,
+                    latent_input_mask=latent_input_mask,
+                )
 
         position_ids = torch.clamp_min(attn.long().cumsum(dim=1) - 1, 0)
 
@@ -207,7 +215,22 @@ class QueryAnchoredColarSeq2SeqTrainer(ColarSeq2SeqTrainer):
 
         ce_loss = self._causal_ce(logits, new_labels)
         condition_query = self._gather_query_hidden(hidden, query_anchor_positions)
-        embed_loss, entropy = self._latent_loss(hidden, gold_source, think_mask, condition_query)
+        update_ss_cache = r > 1 and self.colar_ss_prob > 0 and self.model.training
+        if update_ss_cache:
+            embed_loss, entropy, ss_pred_norm = self._latent_loss(
+                hidden, gold_source, think_mask, condition_query, return_cache_pred=True)
+            self._store_scheduled_sampling_cache(
+                input_ids=input_ids,
+                raw_attention_mask=attention_mask,
+                compressed_attention_mask=attn,
+                r=r,
+                pred_normalized=ss_pred_norm,
+                query_hidden=condition_query,
+                residual_query=residual_query,
+            )
+            del ss_pred_norm
+        else:
+            embed_loss, entropy = self._latent_loss(hidden, gold_source, think_mask, condition_query)
 
         loss_dev = ce_loss.device
         total = self.colar_ce_weight * ce_loss
@@ -367,7 +390,8 @@ class QueryAnchoredColarSeq2SeqTrainer(ColarSeq2SeqTrainer):
         gold_source: torch.Tensor,
         think_mask: torch.Tensor,
         query_hidden: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_cache_pred: bool = False,
+    ):
         lp_dev = next(self.latent_policy.parameters()).device
         h = hidden.to(lp_dev).float()
         q = query_hidden.to(lp_dev).float() if query_hidden is not None else None
@@ -379,10 +403,31 @@ class QueryAnchoredColarSeq2SeqTrainer(ColarSeq2SeqTrainer):
             pred = dist.rsample()
             per = F.mse_loss(pred, gold.detach(), reduction='none').mean(dim=-1)
         else:
+            pred = dist.mean
             per = -dist.log_prob(gold.detach()).mean(dim=-1)
 
         denom = think_mask.sum().clamp_min(1.0)
         embed_loss = (per * think_mask).sum() / denom
         ent = dist.entropy().mean(dim=-1)
         entropy = (ent * think_mask).sum() / denom
+        if return_cache_pred:
+            return embed_loss, entropy, pred.detach()
         return embed_loss, entropy
+
+    def _scheduled_sampling_dist(
+        self,
+        hidden: torch.Tensor,
+        temperature: float,
+        query_hidden: Optional[torch.Tensor] = None,
+    ):
+        return self.latent_policy(hidden, query_hidden=query_hidden, temperature=temperature)
+
+    def _scheduled_sampling_pred_to_embeds(
+        self,
+        pred_next_normalized: torch.Tensor,
+        query_hidden: Optional[torch.Tensor] = None,
+        residual_query: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del query_hidden
+        anchored = self.latent_policy.apply_anchor_normalized(pred_next_normalized, residual_query)
+        return anchored * float(self.embeds_std)

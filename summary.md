@@ -1,6 +1,6 @@
 # Qwen3-Omni CoLaR Latent Reasoning 进展总结
 
-更新时间：2026-06-09
+更新时间：2026-06-10
 
 仓库：
 
@@ -1406,4 +1406,270 @@ QUERY_ANCHOR_CONDITION_INPUT_NORM=1
 QUERY_ANCHOR_RESIDUAL=0
 QUERY_ANCHOR_HIDDEN_SOURCE=prompt_last
 COLAR_EMBED_WEIGHT=2.0
+```
+
+#### B8. RMS drift 诊断、推理 RMS renorm 与 scheduled sampling 接线
+
+按新的排查路线先做了 free-rollout latent RMS 诊断和 EOL seed sweep：
+
+```text
+diagnostic:
+  script: diagnose_latent_rms_drift.py
+  output: output/qwen3omni_colar_mixed_r5_mse_sqrt/rms_drift_diag_r5.jsonl
+  checkpoint: output/qwen3omni_colar_mixed_r5_mse_sqrt/overfit_ckpt_audio_r5/v0-20260607-235138/checkpoint-300
+
+seed sweep:
+  script: sweep_eol_seeds.py
+  output: output/qwen3omni_colar_mixed_r5_mse_sqrt/eol_seed_sweep_idx1.jsonl
+  sample: idx=1
+  seeds: 0..9
+```
+
+关键诊断结果：
+
+```text
+idx=0: gold_rms=1.0080, tf_pred_rms=1.0075, ratio=0.999, rollout_cos_mean=0.9995
+idx=1: gold_rms=0.9063, tf_pred_rms=0.8934, ratio=0.986, rollout_cos_mean=0.9857
+idx=2: gold_rms=1.0017, tf_pred_rms=1.0001, ratio=0.998, rollout_cos_mean=0.9988
+idx=3: gold_rms=0.7918, tf_pred_rms=0.7893, ratio=0.997, rollout_cos_mean=0.9970
+```
+
+idx=1 的 10-seed sweep：
+
+```text
+P(hit_eol) = 8/10
+hit seeds: steps all 356
+miss seeds: 2, 3
+miss seed 2: eol_logprob@gold_end=-22.16, cos_gold_last8 ~= 0.15..0.35
+miss seed 3: eol_logprob@gold_end=-23.29, cos_gold_last8 ~= 0.10..0.31
+```
+
+结论：
+
+```text
+1. baseline r=5 的 free rollout 没有系统性 RMS 漂移；teacher-forced pred RMS 与 gold RMS 基本贴合。
+2. idx=1 的 EOL miss 是采样后方向崩掉/knife-edge stop 事件，不是模长单调缩放问题。
+3. 因此推理时 RMS renorm 可以保留为零成本对照，但不是主线解法。
+4. 主线应继续做 scheduled sampling 或更强 latent 对齐（例如已验证的 COLAR_EMBED_WEIGHT=2.0）。
+```
+
+已接线的推理 RMS renorm：
+
+```text
+baseline infer:
+  colar_plugin/colar_infer.py
+  infer_qwen3omni_colar_overfit.py
+  infer_overfit_check_audio_r5.sh
+  infer_overfit_check_audio_r10.sh
+
+query-anchor infer:
+  colar_plugin/query_anchor_infer.py
+  infer_qwen3omni_query_anchor_overfit.py
+  infer_overfit_check_query_anchor_audio_r5.sh
+  infer_overfit_check_query_anchor_audio_r10.sh
+
+env/CLI:
+  LATENT_RMS_TARGET / --latent-rms-target
+  0 = disabled
+```
+
+scheduled sampling 实现：
+
+```text
+env:
+  COLAR_SS_PROB
+  COLAR_SS_TEMPERATURE
+  COLAR_SS_WARMUP_STEPS
+  COLAR_SS_CACHE_MAX
+
+implementation:
+  cached scheduled sampling, not same-step extra text-model forward
+  reuse current latent-loss prediction to populate a detached per-sample cache
+  next visit to the same sample can replace compressed latent input positions
+  no extra backbone forward, so it works with gradient_checkpointing
+```
+
+为什么用 cached 版本：
+
+```text
+原始 same-step no-grad text-model forward 在 Qwen3-Omni 30B 上会 OOM，并且容易和
+gradient checkpointing 的 recompute 记账冲突。cached 版本保持每个训练 step 只有一次
+主干 forward，适合当前 4 条 overfit 数据反复训练的场景。
+```
+
+smoke 结果：
+
+```text
+wrong topology smoke:
+  CUDA_VISIBLE_DEVICES=0,1,2,3
+  NPROC_PER_NODE=4
+  result: OOM at optimizer state init
+  note: this is 4-card pure DDP, not the established 8-card DDP=4/MP=2 topology.
+
+correct topology smoke:
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+  NPROC_PER_NODE=4
+  output_dir: output/qwen3omni_colar_ss_cached_smoke
+  checkpoint: overfit_ckpt_audio_r5/v1-20260610-120507/checkpoint-3
+  COLAR_SS_PROB=0.25
+  MAX_STEPS=3
+  result: pass, checkpoint saved
+```
+
+3-step smoke losses:
+
+```text
+step 1: loss=4.9551, ce_loss=1.8194, embed_loss=3.1356
+step 2: loss=4.9839, ce_loss=1.8451, embed_loss=3.1388
+step 3: loss=3.0122, ce_loss=1.5622, embed_loss=1.4501
+train_loss=4.3171
+```
+
+Next recommended run:
+
+```text
+DATASET_PATH=output/qwen3omni_colar/overfit_mixed_audio_text.jsonl \
+OUTPUT_DIR=output/qwen3omni_colar_ss025_r5_mse_sqrt \
+COLAR_SS_PROB=0.25 \
+COLAR_SS_TEMPERATURE=1.0 \
+COLAR_SS_WARMUP_STEPS=20 \
+COLAR_EMBED_WEIGHT=2.0 \
+MAX_STEPS=300 \
+SAVE_STEPS=50 \
+SAVE_TOTAL_LIMIT=6 \
+NPROC_PER_NODE=4 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash overfit_check_audio_r5.sh
+```
+
+2026-06-10 五实验训练后推理结果：
+
+```text
+dataset: output/qwen3omni_colar/overfit_mixed_audio_text.jsonl
+limit: 4
+inference setting:
+  MAX_LATENT_FORWARD=400
+  MAX_NEW_TOKENS=512
+  LATENT_TEMPERATURE=1.0
+  EOL_TEMPERATURE=1.0
+  LATENT_RMS_TARGET=0
+
+parallelism:
+  five inference processes were run concurrently on GPU0..GPU4
+```
+
+实验 checkpoint：
+
+```text
+ss010:
+  checkpoint: output/qwen3omni_colar_ss010_r5_mse_sqrt/overfit_ckpt_audio_r5/v0-20260610-122331/checkpoint-300
+  infer output: output/qwen3omni_colar_ss010_r5_mse_sqrt/overfit_infer_r5.jsonl
+
+ss025:
+  checkpoint: output/qwen3omni_colar_ss025_r5_mse_sqrt/overfit_ckpt_audio_r5/v0-20260610-122346/checkpoint-300
+  infer output: output/qwen3omni_colar_ss025_r5_mse_sqrt/overfit_infer_r5.jsonl
+
+ss010_embedw2:
+  checkpoint: output/qwen3omni_colar_ss010_embedw2_r5_mse_sqrt/overfit_ckpt_audio_r5/v0-20260610-122356/checkpoint-300
+  infer output: output/qwen3omni_colar_ss010_embedw2_r5_mse_sqrt/overfit_infer_r5.jsonl
+
+ss025_embedw2:
+  checkpoint: output/qwen3omni_colar_ss025_embedw2_r5_mse_sqrt/overfit_ckpt_audio_r5/v0-20260610-122422/checkpoint-300
+  infer output: output/qwen3omni_colar_ss025_embedw2_r5_mse_sqrt/overfit_infer_r5.jsonl
+
+query_anchor_ss010_embedw2:
+  checkpoint: output/qwen3omni_query_anchor_condnorm_nointer_promptlast_ss010_embedw2_r5_mse_sqrt/overfit_ckpt_audio_r5/v0-20260610-122433/checkpoint-300
+  infer output: output/qwen3omni_query_anchor_condnorm_nointer_promptlast_ss010_embedw2_r5_mse_sqrt/overfit_infer_query_anchor_r5.jsonl
+```
+
+单次推理结果：
+
+```text
+all five experiments:
+  eol hits: 4/4
+  answer-ish matches: 4/4
+  latent steps: [94, 356, 121, 104]
+
+match detail:
+  response_in_full_expected: 4/4
+  answer_response_in_expected: 4/4
+  answer_expected_in_response: 2/4
+  full_expected_in_response: 0/4
+```
+
+解释：
+
+```text
+日志中的 answer_match=False/False/True/True 是较严格口径；
+JSONL 的 answer-ish 口径只要 answer_response_in_expected 或
+answer_expected_in_response 为真即算匹配，因此五个实验都是 4/4。
+```
+
+idx=1 seed sweep：
+
+```text
+script: sweep_eol_seeds.py
+sample: idx=1
+seeds: 0..9
+parallelism: five sweep processes were run concurrently on GPU0..GPU4
+
+code update:
+  sweep_eol_seeds.py now supports:
+    --backend colar
+    --backend query_anchor
+    --latent-rms-target
+  query-anchor sweep uses the same query_hidden/residual-anchor path as
+  colar_plugin/query_anchor_infer.py.
+```
+
+10-seed EOL sweep results：
+
+```text
+ss010:
+  output: output/qwen3omni_colar_ss010_r5_mse_sqrt/eol_seed_sweep_idx1.jsonl
+  P(hit_eol): 10/10
+  steps: 356..356
+  gold-end eol logprob mean: -2.16e-05
+  best pre-gold-end eol logprob max: -16.10
+
+ss025:
+  output: output/qwen3omni_colar_ss025_r5_mse_sqrt/eol_seed_sweep_idx1.jsonl
+  P(hit_eol): 10/10
+  steps: 356..356
+  gold-end eol logprob mean: -1.06e-04
+  best pre-gold-end eol logprob max: -13.59
+
+ss010_embedw2:
+  output: output/qwen3omni_colar_ss010_embedw2_r5_mse_sqrt/eol_seed_sweep_idx1.jsonl
+  P(hit_eol): 10/10
+  steps: 356..356
+  gold-end eol logprob mean: -8.45e-06
+  best pre-gold-end eol logprob max: -15.32
+
+ss025_embedw2:
+  output: output/qwen3omni_colar_ss025_embedw2_r5_mse_sqrt/eol_seed_sweep_idx1.jsonl
+  P(hit_eol): 10/10
+  steps: 356..356
+  gold-end eol logprob mean: -1.85e-06
+  best pre-gold-end eol logprob max: -15.17
+
+query_anchor_ss010_embedw2:
+  output: output/qwen3omni_query_anchor_condnorm_nointer_promptlast_ss010_embedw2_r5_mse_sqrt/eol_seed_sweep_idx1.jsonl
+  P(hit_eol): 10/10
+  steps: 356..356
+  gold-end eol logprob mean: -2.02e-05
+  best pre-gold-end eol logprob max: -14.49
+```
+
+当前结论：
+
+```text
+1. 原始 mixed r=5 baseline 在 idx=1 上是 8/10 EOL hit；这五个 scheduled-sampling
+   版本均达到 10/10。
+2. 五个实验的 idx=1 都精确在 gold compressed length 356 处停止，没有早停。
+3. 因此 cached scheduled sampling 对该随机 EOL miss 有明确修复效果。
+4. 单看当前 4-sample overfit 和 idx=1 10-seed sweep，五个实验都已满分，无法证明
+   query-anchor condition head 在 overfit setting 下有额外收益。
+5. 从 gold-end EOL spike 强度看，ss025_embedw2 最强；但这只是 overfit 诊断指标，
+   不能直接外推到全量数据。
 ```

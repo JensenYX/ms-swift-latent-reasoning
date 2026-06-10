@@ -30,6 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${PROGRESS_EVERY:=128}"
 : "${LATENT_TEMPERATURE:=1.0}"
 : "${EOL_TEMPERATURE:=1.0}"
+: "${LATENT_RMS_TARGET:=0}"
 
 export CUDA_VISIBLE_DEVICES
 export NUMBA_CACHE_DIR
@@ -65,6 +66,7 @@ CMD=(
     --progress-every "${PROGRESS_EVERY}"
     --latent-temperature "${LATENT_TEMPERATURE}"
     --eol-temperature "${EOL_TEMPERATURE}"
+    --latent-rms-target "${LATENT_RMS_TARGET}"
     --require-latent-policy
 )
 

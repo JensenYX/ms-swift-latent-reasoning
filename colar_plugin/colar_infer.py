@@ -39,6 +39,10 @@ class ColarInferConfig:
     max_new_tokens: int = 8192
     answer_temperature: float = 0.0
     progress_every: int = 0
+    # >0 时，每个 free-rollout 预测 latent 在喂回主干前，于归一化空间
+    # （embedding/embeds_std）把 RMS 重置为该值。gold compressed latent 的 RMS
+    # 可由 diagnose_latent_rms_drift.py 实测。0 = 关闭（保持原行为）。
+    latent_rms_target: float = 0.0
 
 
 def load_colar_infer_config(checkpoint: Path, overrides: Optional[Dict[str, Any]] = None) -> ColarInferConfig:
@@ -61,6 +65,7 @@ def load_colar_infer_config(checkpoint: Path, overrides: Optional[Dict[str, Any]
         max_new_tokens=int(overrides.get('max_new_tokens', 8192)),
         answer_temperature=float(overrides.get('answer_temperature', 0.0)),
         progress_every=int(overrides.get('progress_every', 0)),
+        latent_rms_target=float(overrides.get('latent_rms_target', 0.0)),
     )
 
 
@@ -215,6 +220,9 @@ class ColarLatentGenerator:
             else:
                 dist = self.latent_policy(lp_hidden, temperature=cfg.latent_temperature)
                 sampled = dist.rsample()
+            if cfg.latent_rms_target > 0:
+                rms = sampled.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-6)
+                sampled = sampled * (cfg.latent_rms_target / rms).to(sampled.dtype)
             current_inputs_embeds = sampled.to(device=self.text_device, dtype=question_embeds.dtype) * cfg.embeds_std
             all_inputs_embeds.append(current_inputs_embeds)
 
